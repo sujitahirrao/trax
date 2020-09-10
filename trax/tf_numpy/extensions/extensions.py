@@ -271,14 +271,35 @@ def grad(f, has_aux=False):
 
 # A workaround for b/121383831
 _orig_result_is_list = threading.local()
+_orig_result_is_empty = threading.local()
+_orig_result_structure = threading.local()
 
 
 def _record_result_type(f):
+  """A decorator that records some information about the function result.
+
+  Args:
+    f: the original function.
+
+  Returns:
+    A transformed function that records some information about the result of the
+    original function.
+  """
   # A wrapper just for setting _orig_result_is_list, as a workaround for
   # b/121383831
   def wrapper(*args, **kwargs):
     res = f(*args, **kwargs)
     _orig_result_is_list.val = isinstance(res, list)
+    # If outputs are empty, xla.compile returns an `Operation`, which we don't
+    # want.
+    if tf.nest.flatten(res):
+      _orig_result_is_empty.val = False
+      _orig_result_structure.val = None
+    else:
+      _orig_result_is_empty.val = True
+      # Without map_structure, xla.compile will change
+      # _orig_result_structure.val to a list of `Operation`.
+      _orig_result_structure.val = tf.nest.map_structure(lambda x: x, res)
     return res
 
   return wrapper
@@ -288,7 +309,8 @@ def jit(f,
         static_argnums=(),
         xla_forced_compile=False,
         input_signature=None,
-        autograph=False):
+        autograph=False,
+        experimental_compile=False):
   """Returns a function that runs a trace-compiled version of `f`.
 
   A trace-compiled version of a function `f` has the same behavior as `f` (when
@@ -324,12 +346,16 @@ def jit(f,
       `if` and `while` to their TensorFlow counterparts. See the
       [doc](https://www.tensorflow.org/api_docs/python/tf/function]) of
         `tf.function` for details.
+    experimental_compile: the `experimental_compile` flag for `tf.function`. See
+      the [doc](https://www.tensorflow.org/api_docs/python/tf/function]) of
+      `tf.function` for details.
 
   Returns:
     A trace-compiled version of f.
   """
 
-  @tf.function(input_signature=input_signature, autograph=autograph)
+  @tf.function(input_signature=input_signature, autograph=autograph,
+               experimental_compile=experimental_compile)
   def _tf_f(*args, **kwargs):
     """Accelerated function with tensor inputs/outputs."""
     np_args = _tf_to_np(args)
@@ -339,8 +365,10 @@ def jit(f,
       f_ = _record_result_type(f)
       np_out = tf.xla.experimental.compile(lambda: f_(*np_args, **kwargs))
       # Workaround b/121383831
-      if (isinstance(np_out, list) and len(np_out) == 1 and
-          not _orig_result_is_list.val):
+      if _orig_result_is_empty.val:
+        np_out = _orig_result_structure.val
+      elif (isinstance(np_out, list) and len(np_out) == 1 and
+            not _orig_result_is_list.val):
         np_out = np_out[0]
     else:
       np_out = f(*np_args, **kwargs)
