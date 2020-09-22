@@ -25,8 +25,10 @@ from trax.fastmath import numpy as jnp
 from trax.layers import base
 from trax.layers import initializers as init
 from trax.layers.base import Fn
+from trax.layers.shape import ash
 
 
+@ash('*a->*b')
 class Dense(base.Layer):
   """A dense (a.k.a. fully-connected, affine) layer.
 
@@ -112,6 +114,7 @@ class Dense(base.Layer):
       self.weights = w
 
 
+@ash('*->*b')
 class Embedding(base.Layer):
   """Trainable layer that maps discrete tokens/ids to vectors."""
 
@@ -164,6 +167,7 @@ class Embedding(base.Layer):
     self.weights = w
 
 
+@ash('*->*')
 class Dropout(base.Layer):
   """A layer that stochastically ignores a subset of inputs each training step.
 
@@ -385,6 +389,7 @@ def Flatten(n_axes_to_keep=1):
   return Fn(layer_name, f)
 
 
+@ash('*->*')
 def Exp():
   """Returns a layer that computes the element-wise exponential of a tensor."""
   return Fn('Exp', lambda x: jnp.exp(x))  # pylint: disable=unnecessary-lambda
@@ -480,11 +485,13 @@ def Sum(axis=-1, keepdims=False):
   return Fn('Sum', lambda x: jnp.sum(x, axis=axis, keepdims=keepdims))
 
 
+@ash('*->*')
 def Negate():
   """Returns a layer that computes the element-wise negation of a tensor."""
   return Fn('Negate', lambda x: -x)
 
 
+@ash('*->*')
 def StopGradient():
   """Returns an identity layer with a stop gradient."""
   return Fn('StopGradient', lambda x: fastmath.stop_gradient(x))  # pylint: disable=unnecessary-lambda
