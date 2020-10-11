@@ -34,6 +34,7 @@ from trax.layers.normalization import *
 from trax.layers.pooling import *
 from trax.layers.research.efficient_attention import *
 from trax.layers.research.position_encodings import *
+from trax.layers.research.sparsity import *
 from trax.layers.reversible import *
 from trax.layers.rnn import *
 
@@ -70,6 +71,8 @@ CausalFavor = layer_configure(CausalFavor, blacklist=['mode'])
 DotProductCausalAttention = layer_configure(
     DotProductCausalAttention, blacklist=['mode'])
 SelfAttention = layer_configure(SelfAttention, blacklist=['mode'])
+ModularCausalAttention = layer_configure(ModularCausalAttention,
+                                         blacklist=['mode'])
 LSHSelfAttention = layer_configure(LSHSelfAttention, blacklist=['mode'])
 EncDecAttention = layer_configure(EncDecAttention, blacklist=['mode'])
 

@@ -387,22 +387,23 @@ class Scan(base.Layer):
       inputs = tuple(inputs)  # so that inputs structure matches outputs
     n_carry = self._n_carry
     def scannable_fn(x, carry_and_state):  # pylint: disable=invalid-name
-      carry, state = carry_and_state
+      carry, state, i = carry_and_state
       x_and_carry = x + carry if n_carry > 0 else x
+      rng = fastmath.random.fold_in(self.rng, i)
       res, new_state = self.sublayer.pure_fn(
-          x_and_carry, weights, state, self.rng, use_cache=True)
+          x_and_carry, weights, state, rng, use_cache=True)
       if n_carry > 0:
-        return (res[:-n_carry], (res[-n_carry:], new_state))
+        return (res[:-n_carry], (res[-n_carry:], new_state, i+1))
       else:
-        return (res, ([], new_state))
+        return (res, ([], new_state, i+1))
 
     if n_carry > 0:
       xs = inputs[:-n_carry]  # Split input stack into inputs and carry.
-      init = (inputs[-n_carry:], self.state[0])
+      init = (inputs[-n_carry:], self.state[0], jnp.array(0, dtype=jnp.int32))
     else:
-      xs, init = inputs, ([], self.state[0])
-    ys, (carry, new_state) = _scan(scannable_fn, xs, init,
-                                   axis=self._axis, remat=self._remat)
+      xs, init = inputs, ([], self.state[0], jnp.array(0, dtype=jnp.int32))
+    ys, (carry, new_state, _) = _scan(scannable_fn, xs, init,
+                                      axis=self._axis, remat=self._remat)
     res = ys + carry if n_carry > 0 else ys
     self.state = (new_state,)
     return res  # Put outputs and carry back on stack.
@@ -581,17 +582,22 @@ class Cond(base.Layer):
 
 
 # pylint: disable=invalid-name
-def Chunk(layer, chunk_size):
+def Chunk(layer, chunk_size, pass_unchunkable=True):
   """Executes `layer` using batch chunks of size `chunk_size` to save memory."""
   if chunk_size < 1:
     return layer
   def reshape_to_chunks(x):
     chunk_batch = x.shape[0]
-    if chunk_batch % chunk_size != 0:
-      raise ValueError(f'Chunk size {chunk_size} must divide batch '
-                       f'size {chunk_batch}')
-    n_chunks = chunk_batch // chunk_size
-    return jnp.reshape(x, [n_chunks, chunk_size] + list(x.shape[1:]))
+    size = chunk_size
+    n_chunks = chunk_batch // size
+    if chunk_batch % size != 0:
+      if pass_unchunkable:
+        n_chunks = 1
+        size = chunk_batch
+      else:
+        raise ValueError(f'Chunk size {size} must divide batch '
+                         f'size {chunk_batch}')
+    return jnp.reshape(x, [n_chunks, size] + list(x.shape[1:]))
   reshape_to_chunks_layer = base.PureLayer(
       lambda xs: fastmath.nested_map(reshape_to_chunks, xs),
       n_in=layer.n_in, n_out=layer.n_in, name='ReshapeToChunks')

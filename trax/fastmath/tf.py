@@ -127,6 +127,14 @@ def _tf_grad(f, **kwargs):
   return grad_f
 
 
+def _fold_in(rng, d):
+  """Equivalent of jax.random.fold_in."""
+  # TODO(lukaszkaiser): verify that this function has good randomness
+  # properties or switch to an implementation equivalent to JAX.
+  _, rng = tf_np_extensions.split(rng + tf_np.sum(d).astype(tf_np.int64), 2)
+  return rng
+
+
 TF_BACKEND = {
     'name': 'tensorflow-numpy',
     'np': tf_np,
@@ -154,6 +162,7 @@ TF_BACKEND = {
     'random_bernoulli': tf_np_extensions.bernoulli,
     'random_get_prng': tf_np_extensions.prng,
     'random_split': tf_np_extensions.split,
+    'random_fold_in': _fold_in,
     # TODO(wangpeng): See whether and how to support `remat`
     'remat': lambda f: f,
     'scan': tf_np_extensions.scan,
@@ -162,4 +171,5 @@ TF_BACKEND = {
     'device_count': lambda: max(len(tf_np_extensions.accelerators()), 1),
     'pmap': _tf_pmap,
     'psum': tf_np_extensions.psum,
+    'vmap': tf_np_extensions.vmap,
 }

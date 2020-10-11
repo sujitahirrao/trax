@@ -28,12 +28,11 @@ import numpy as np
 from t5.data import preprocessors as t5_processors
 from t5.data import sentencepiece_vocabulary as t5_spc_vocab
 from t5.data import utils as t5_utils
-from tensor2tensor.data_generators import text_encoder as t2t_text_encoder
 import tensorflow as tf   # pylint: disable=g-explicit-tensorflow-version-import
 import tensorflow_datasets as tfds
 import tensorflow_text as tf_text
 from trax import fastmath
-
+from trax.data import text_encoder
 
 # How many examples from the stream to skip at random during training.
 # For now, we skip at most 100K examples for efficiency.
@@ -324,7 +323,7 @@ def tokenize(stream, keys=None, vocab_type='subword',
       yield tuple(new_example)
     elif isinstance(example, dict):
       new_example = {}
-      for k in example.keys():
+      for k in example:
         if keys is None or k in keys:
           new_example[k] = np.array(vocab.encode(example[k])) + n_reserved_ids
         else:
@@ -402,13 +401,13 @@ def _get_vocab(vocab_type='subword', vocab_file=None, vocab_dir=None):
     # Note that we set num_reserved_ids=0 below. We could instead pass
     # the value n_reserved_ids from tokenize here -- ByteTextEncoder does
     # exactly the same thing as tokenize above, ie., adds num_reserved_ids.
-    return t2t_text_encoder.ByteTextEncoder(num_reserved_ids=0)
+    return text_encoder.ByteTextEncoder(num_reserved_ids=0)
 
   vocab_dir = vocab_dir or 'gs://trax-ml/vocabs/'
   path = os.path.join(vocab_dir, vocab_file)
 
   if vocab_type == 'subword':
-    return t2t_text_encoder.SubwordTextEncoder(path)
+    return text_encoder.SubwordTextEncoder(path)
 
   assert vocab_type == 'sentencepiece'
   return t5_spc_vocab.SentencePieceVocabulary(sentencepiece_model_file=path)
@@ -698,9 +697,25 @@ def c4_bare_preprocess_fn(dataset,
   output_features = {'targets': feature, 'inputs': feature}
 
   # Tokenize the targets.
-  dataset = t5_utils.encode_string_features(
-      dataset, output_features, keys=output_features,
-      copy_plaintext=copy_plaintext)
+  keys = output_features
+  def encode_string_features_fn(features):
+    """Encode all specified feature that are strings and return a dictionary.
+
+    Args:
+      features: a dictionary
+    Returns:
+      a dictionary
+    """
+    ret = {}
+    for k, v in features.items():
+      if k in keys and v.dtype == tf.string:
+        if copy_plaintext:
+          ret['%s_plaintext' % k] = v
+        v = tf.cast(output_features[k].vocabulary.encode_tf(v), tf.int64)
+      ret[k] = v
+    return ret
+  dataset = dataset.map(encode_string_features_fn,
+                        num_parallel_calls=tf.data.experimental.AUTOTUNE)
 
   # Preprocess the tokens - the exact preprocessors are set via gin.
   dataset = t5_processors.unsupervised(dataset,
