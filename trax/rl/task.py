@@ -276,6 +276,7 @@ class RLTask:
                initial_trajectories=1,
                gamma=0.99,
                dm_suite=False,
+               random_starts=True,
                max_steps=None,
                timestep_to_np=None,
                num_stacked_frames=1,
@@ -292,6 +293,7 @@ class RLTask:
         trajectories are stored.
       gamma: float: discount factor for calculating returns.
       dm_suite: whether we are using the DeepMind suite or the gym interface
+      random_starts: use random starts for training of Atari agents.
       max_steps: Optional int: stop all trajectories at that many steps.
       timestep_to_np: a function that turns a timestep into a numpy array
         (ie., a tensor); if None, we just use the state of the timestep to
@@ -303,28 +305,40 @@ class RLTask:
     if isinstance(env, str):
       self._env_name = env
       if dm_suite:
-        env = environments.load_from_settings(
-            platform='atari',
-            settings={
-                'levelName': env,
-                'interleaved_pixels': True,
-                'zero_indexed_actions': True
-            })
         eval_env = environments.load_from_settings(
             platform='atari',
             settings={
                 'levelName': env,
                 'interleaved_pixels': True,
                 'zero_indexed_actions': True,
-                'random_noops_range': 30,
+                'phase': 'testing',
             })
         eval_env = atari_wrapper.AtariWrapper(
             environment=eval_env,
             max_abs_reward=None,
             num_stacked_frames=num_stacked_frames)
-        env = atari_wrapper.AtariWrapper(environment=env,
-                                         num_stacked_frames=num_stacked_frames)
-
+        if random_starts:
+          env = environments.load_from_settings(
+              platform='atari',
+              settings={
+                  'levelName': env,
+                  'interleaved_pixels': True,
+                  'zero_indexed_actions': True,
+                  'phase': 'training'
+              })
+        else:
+          # This is the default behavior used so far
+          # in QWR experiments (implicitly 'condition': 'at30').
+          env = environments.load_from_settings(
+              platform='atari',
+              settings={
+                  'levelName': env,
+                  'interleaved_pixels': True,
+                  'zero_indexed_actions': True
+              })
+        env = atari_wrapper.AtariWrapper(
+            environment=env,
+            num_stacked_frames=num_stacked_frames)
       else:
         env = gym.make(env)
         eval_env = env

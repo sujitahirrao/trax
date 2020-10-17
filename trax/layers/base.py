@@ -578,13 +578,14 @@ class Layer:
       res = self.forward(y)
       s = self.state
       self.weights, self.state, self._rng = old_weights, old_state, old_rng
-      return (res, s), (y, res, weights, s)
+      return (res, s), (state, rng, y, res, weights, s)
 
-    def _f_bwd(state, rng, residual, grad):
+    def _f_bwd(residual, grad):
       """Custom gradient function."""
-      y, output, weights, new_state = residual
+      state, rng, y, output, weights, new_state = residual
       grad = grad[0]  # Ignore dummy gradient wrt state.
-      return self.backward(y, output, grad, weights, state, new_state, rng)
+      out = self.backward(y, output, grad, weights, state, new_state, rng)
+      return (None, None, *out)
 
     do_forward = fastmath.custom_vjp(_f, _f_fwd, _f_bwd, nondiff_argnums=(0, 1))
 

@@ -24,7 +24,6 @@ from trax import fastmath
 from trax import layers as tl
 from trax.fastmath import numpy as np
 from trax.layers import base
-from trax.layers import combinators as cb
 from trax.layers import core
 from trax.layers import initializers as init
 from trax.layers import metrics
@@ -196,39 +195,6 @@ def ModularCausalAttention(d_feature, n_heads=1, dropout=0.0,  # pylint: disable
     n_modules: Number of modules used in LocallyConnectedDense.
     mode: One of `'train'`, `'eval'`, or `'predict'`.
   """
-  if d_feature % n_heads != 0:
-    raise ValueError(
-        f'Dimensionality of feature embedding ({d_feature}) is not a multiple '
-        f'of the requested number of attention heads ({n_heads}).')
-
-  d_head = d_feature // n_heads
-
-  @assert_shape('bld->hlx')
-  def _split_into_heads():
-    """Returns a layer that reshapes tensors for multi-headed computation."""
-    def f(x):
-      batch_size = x.shape[0]
-      seq_len = x.shape[1]
-
-      # (b_size, seq_len, d_feature) --> (b_size*n_heads, seq_len, d_head)
-      x = x.reshape((batch_size, seq_len, n_heads, d_head))
-      x = x.transpose((0, 2, 1, 3))
-      x = x.reshape((batch_size * n_heads, seq_len, d_head))
-      return x
-    return tl.Fn('SplitIntoHeads', f)
-
-  @assert_shape('hlx->bld')
-  def _merge_heads():
-    """Returns a layer that undoes splitting, after multi-head computation."""
-    def f(x):
-      seq_len = x.shape[1]
-
-      # (b_size*n_heads, seq_len, d_head) --> (b_size, seq_len, d_feature)
-      x = x.reshape((-1, n_heads, seq_len, d_head))
-      x = x.transpose((0, 2, 1, 3))
-      x = x.reshape((-1, seq_len, d_head * n_heads))
-      return x
-    return tl.Fn('MergeHeads', f)
 
   @assert_shape('...a->...b')
   def ProcessingLayer():  # pylint: disable=invalid-name
@@ -238,18 +204,12 @@ def ModularCausalAttention(d_feature, n_heads=1, dropout=0.0,  # pylint: disable
       assert d_feature % n_modules == 0
       return LocallyConnectedDense(n_modules, d_feature // n_modules)
 
-  return cb.Serial(
-      cb.Branch(
-          [ProcessingLayer(), _split_into_heads()],
-          [ProcessingLayer(), _split_into_heads()],
-          [ProcessingLayer(), _split_into_heads()],
-      ),
-      tl.DotProductCausalAttention(
+  return tl.ConfigurableAttention(
+      ProcessingLayer(), ProcessingLayer(), ProcessingLayer(),
+      ProcessingLayer(), n_heads=n_heads,
+      qkv_attention_layer=tl.DotProductCausalAttention(
           dropout=dropout, max_inference_length=max_inference_length,
-          mode=mode),
-      _merge_heads(),
-      ProcessingLayer()
-  )
+          mode=mode))
 
 
 def CausalFavor(d_feature, n_heads=1, dropout=0.0,  # pylint: disable=invalid-name
@@ -271,40 +231,6 @@ def CausalFavor(d_feature, n_heads=1, dropout=0.0,  # pylint: disable=invalid-na
   """
   del dropout, mode  # not implemented yet but needed in the API
 
-  # TODO(lukaszkaiser): make an API for split/merge heads in core layers,
-  # and use it here so we don't duplicate these functions.
-  if d_feature % n_heads != 0:
-    raise ValueError(
-        f'Dimensionality of feature embedding ({d_feature}) is not a multiple '
-        f'of the requested number of attention heads ({n_heads}).')
-
-  d_head = d_feature // n_heads
-
-  def _split_into_heads():
-    """Returns a layer that reshapes tensors for multi-headed computation."""
-    def f(x):
-      batch_size = x.shape[0]
-      seq_len = x.shape[1]
-
-      # (b_size, seq_len, d_feature) --> (b_size*n_heads, seq_len, d_head)
-      x = x.reshape((batch_size, seq_len, n_heads, d_head))
-      x = x.transpose((0, 2, 1, 3))
-      x = x.reshape((-1, seq_len, d_head))
-      return x
-    return base.Fn('SplitIntoHeads', f)
-
-  def _merge_heads():
-    """Returns a layer that undoes splitting, after multi-head computation."""
-    def f(x):
-      seq_len = x.shape[1]
-
-      # (b_size*n_heads, seq_len, d_head) --> (b_size, seq_len, d_feature)
-      x = x.reshape((-1, n_heads, seq_len, d_head))
-      x = x.transpose((0, 2, 1, 3))
-      x = x.reshape((-1, seq_len, n_heads * d_head))
-      return x
-    return base.Fn('MergeHeads', f)
-
   def favor_numerator_fwd(init_prefix_sum_value, precision,
                           query_prime, key_prime, value):
     def body(p, qkv):
@@ -314,10 +240,10 @@ def CausalFavor(d_feature, n_heads=1, dropout=0.0,  # pylint: disable=invalid-na
       return p, x_slice
     p, w = fastmath.scan(body, init_prefix_sum_value,
                          (query_prime, key_prime, value))
-    return w, (p, query_prime, key_prime, value)
+    return w, (precision, p, query_prime, key_prime, value)
 
-  def favor_numerator_bwd(init_prefix_sum_value, precision, pqkv, w_ct):
-    del init_prefix_sum_value
+  def favor_numerator_bwd(pqkv, w_ct):
+    precision, p, qs, ks, vs = pqkv
 
     def body(carry, qkv_xct):
       p, p_ct = carry
@@ -329,10 +255,9 @@ def CausalFavor(d_feature, n_heads=1, dropout=0.0,  # pylint: disable=invalid-na
       p -= np.einsum('...m,...d->...md', k, v, precision=precision)
       return (p, p_ct), (q_ct, k_ct, v_ct)
 
-    p, qs, ks, vs = pqkv
     _, (qs_ct, ks_ct, vs_ct) = fastmath.scan(
         body, (p, np.zeros_like(p)), (qs, ks, vs, w_ct), reverse=True)
-    return qs_ct, ks_ct, vs_ct
+    return (None, None, qs_ct, ks_ct, vs_ct)
 
   def favor_numerator(init_prefix_sum_value, precision, query_prime,
                       key_prime, value):
@@ -341,8 +266,7 @@ def CausalFavor(d_feature, n_heads=1, dropout=0.0,  # pylint: disable=invalid-na
     return w
 
   favor_numerator = fastmath.custom_vjp(
-      favor_numerator, favor_numerator_fwd, favor_numerator_bwd,
-      nondiff_argnums=(0, 1))
+      favor_numerator, favor_numerator_fwd, favor_numerator_bwd)
 
   def favor_denominator_fwd(init_prefix_sum_value, precision,
                             query_prime, key_prime):
@@ -353,10 +277,10 @@ def CausalFavor(d_feature, n_heads=1, dropout=0.0,  # pylint: disable=invalid-na
       return p, x
 
     p, r = fastmath.scan(body, init_prefix_sum_value, (query_prime, key_prime))
-    return r, (query_prime, key_prime, p)
+    return r, (precision, query_prime, key_prime, p)
 
-  def favor_denominator_bwd(init_prefix_sum_value, precision, qkp, r_ct):
-    del init_prefix_sum_value
+  def favor_denominator_bwd(qkp, r_ct):
+    precision, qs, ks, p = qkp
 
     def body(carry, qkx):
       p, p_ct = carry
@@ -367,10 +291,9 @@ def CausalFavor(d_feature, n_heads=1, dropout=0.0,  # pylint: disable=invalid-na
       p -= k
       return (p, p_ct), (q_ct, k_ct)
 
-    qs, ks, p = qkp
     _, (qs_ct, ks_ct) = fastmath.scan(
         body, (p, np.zeros_like(p)), (qs, ks, r_ct), reverse=True)
-    return (qs_ct, ks_ct)
+    return (None, None, qs_ct, ks_ct)
 
   def favor_denominator(init_prefix_sum_value, precision, query_prime,
                         key_prime):
@@ -379,8 +302,7 @@ def CausalFavor(d_feature, n_heads=1, dropout=0.0,  # pylint: disable=invalid-na
     return r
 
   favor_denominator = fastmath.custom_vjp(
-      favor_denominator, favor_denominator_fwd, favor_denominator_bwd,
-      nondiff_argnums=(0, 1))
+      favor_denominator, favor_denominator_fwd, favor_denominator_bwd)
 
   favor_denominator.defvjp(favor_denominator_fwd, favor_denominator_bwd)
 
@@ -405,23 +327,16 @@ def CausalFavor(d_feature, n_heads=1, dropout=0.0,  # pylint: disable=invalid-na
                           np.moveaxis(key_prime, 1, 0))
     w = np.moveaxis(w, 0, 1)
     r = np.moveaxis(r, 0, 1)
-
-    r = r + 2 * numerical_stabilizer * (np.abs(r) <= numerical_stabilizer)
+    # r = r + 2 * numerical_stabilizer * (np.abs(r) <= numerical_stabilizer)
     r = np.reciprocal(r)
     r = np.expand_dims(r, len(r.shape))
     renormalized_attention = w * r
     return renormalized_attention
 
-  return cb.Serial(
-      cb.Branch(
-          [core.Dense(d_feature), _split_into_heads()],
-          [core.Dense(d_feature), _split_into_heads()],
-          [core.Dense(d_feature), _split_into_heads()],
-      ),
-      base.Fn('FAVOR', favor),
-      _merge_heads(),
-      core.Dense(d_feature),
-  )
+  return tl.ConfigurableAttention(
+      core.Dense(d_feature), core.Dense(d_feature), core.Dense(d_feature),
+      core.Dense(d_feature), n_heads=n_heads,
+      qkv_attention_layer=base.Fn('FAVOR', favor))
 
 
 class SparseFF(base.Layer):

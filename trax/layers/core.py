@@ -17,7 +17,6 @@
 """Core layer types, such as `Dense`, `Embedding`, and `Dropout`."""
 
 from absl import logging
-import jax
 import numpy as np
 
 from trax import fastmath
@@ -120,7 +119,17 @@ class Dense(base.Layer):
 # dimension at the end. This dimension size corresponds to embedding depth.
 @assert_shape('...->...d')
 class Embedding(base.Layer):
-  """Trainable layer that maps discrete tokens/ids to vectors."""
+  """Trainable layer that maps discrete tokens/ids to vectors.
+
+  Embedding layers are commonly used to map discrete data, like words in NLP,
+  into vectors. Here is a canonical example::
+
+      vocab_size = 5
+      word_ids = np.array([1, 2, 3, 4], dtype=np.int32)  # word_ids < vocab_size
+      embedding_layer = tl.Embedding(vocab_size, 32)
+      embedding_layer.init(trax.shapes.signature(word_ids))
+      embedded = embedding_layer(word_ids)  # embedded.shape = (4, 32)
+  """
 
   def __init__(self,
                vocab_size,
@@ -184,6 +193,10 @@ class Dropout(base.Layer):
 
   This layer is active only during training (`mode='train'`). In other
   circumstances it is a no-op.
+
+  Originally introduced in the paper "Dropout: A Simple Way to Prevent Neural
+  Networks from Overfitting" available under the following link:
+  https://www.cs.toronto.edu/~hinton/absps/JMLRdropout.pdf
   """
 
   def __init__(self, rate=0.0, shared_axes=None, mode='train'):
@@ -224,13 +237,8 @@ class Dropout(base.Layer):
     mask_shape = list(x.shape)
     for axis in self._shared_axes:
       mask_shape[axis] = 1
-    if fastmath.is_backend(fastmath.Backend.JAX):
-      keep_prob = jax.lax.tie_in(self.rng, 1.0 - rate)
-    else:
-      keep_prob = 1.0 - rate
+    keep_prob = 1.0 - rate
     keep = fastmath.random.bernoulli(rng, keep_prob, tuple(mask_shape))
-    if fastmath.is_backend(fastmath.Backend.JAX):
-      keep_prob = jax.lax.tie_in(keep, keep_prob)
     mask = keep.astype(x.dtype) / keep_prob
     return x * mask
 
@@ -360,6 +368,14 @@ class RandomUniform(base.Layer):
     self._sync = sync
 
   def forward(self, xs):
+    """Executes this layer as part of a forward pass through the model.
+
+    Args:
+      xs: Unused tensors.
+
+    Returns:
+      Random uniform tensor of the shape and type specified in constructor.
+    """
     rng = self._get_conditionally_synced_rng()
     result = fastmath.random.uniform(
         rng, self._shape, self._dtype, self._min_val, self._max_val)
@@ -708,7 +724,7 @@ def logsoftmax_sample(log_probs, temperature=1.0):  # pylint: disable=invalid-na
   """Returns a sample from a log-softmax output, with temperature.
 
   Args:
-    log_probs: Logarithms of probabilities (often coming from LogSofmax)
+    log_probs: Logarithms of probabilities (often coming from LogSoftmax)
     temperature: For scaling before sampling (1.0 = default, 0.0 = pick argmax)
   """
   # This is equivalent to sampling from a softmax with temperature.
