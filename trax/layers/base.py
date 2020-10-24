@@ -14,7 +14,7 @@
 # limitations under the License.
 
 # Lint as: python3
-"""Base layer class."""
+"""The key layer abstraction (Layer class) and supporting machinery."""
 
 import copy
 import gzip
@@ -42,19 +42,22 @@ GET_STATE_FROM_CACHE = {'__marker_for_cached_state_': ()}
 class Layer:
   """Base class for composable layers in a deep learning network.
 
-  Layers are the basic building blocks for deep learning models. A Trax layer
+  Layers are the basic building blocks for deep learning models. A layer
   computes a function from zero or more inputs to zero or more outputs,
   optionally using trainable weights (common) and non-parameter state (not
-  common). Authors of new layer subclasses typically override at most two
-  methods of the base `Layer` class:
+  common).
+
+  Layer subclasses typically override at most two methods of the base `Layer`
+  class:
 
     `forward(inputs)`:
-      Computes this layer's output as part of a forward pass through the model.
+      Computes the layer's output as part of a forward pass through the model.
 
     `init_weights_and_state(self, input_signature)`:
-      Initializes weights and state for inputs with the given signature.
+      Initializes the layer's weights and state to handle input with the given
+      signature (number, shapes and dtypes of input arguments).
 
-  A small subset of layer types are combinators -- they organize the computation
+  A small number of layer types are combinators -- they organize the computation
   of their sublayers, e.g., applying their sublayers in series or in parallel.
 
   All layers have the following properties, with default values implemented
@@ -96,7 +99,7 @@ class Layer:
       n_out: Number of outputs promised by this layer.
       name: Class-like name for this layer; for use when printing this layer.
       sublayers_to_print: Sublayers to display when printing out this layer;
-        By default (when None) we display all sublayers.
+        if None (the default), display all sublayers.
     """
     self._n_in = n_in
     self._n_out = n_out
@@ -111,7 +114,7 @@ class Layer:
     # The private fields _weights and _state store the private part of
     # layer weights and state. When a layer has no sublayers, these are
     # the same as layer.weights and layer.state. For layers with sublayers
-    # (ie., combinators), these just mark which weights are cached -- see
+    # (i.e., combinators), these just mark which weights are cached -- see
     # the getter and setter for weights and state for details.
     # There is no need to use these fields in most user-implemented classes.
     self._weights = EMPTY_WEIGHTS  # By default no trainable weights.
@@ -126,18 +129,29 @@ class Layer:
     self._jit_cache = {}
 
   def __repr__(self):
+    """Renders this layer as a medium-detailed string, to help in debugging.
+
+    Subclasses should aim for high-signal/low-noise when overriding this
+    method.
+
+    Returns:
+      A high signal-to-noise string representing this layer.
+    """
     def indent_string(x):
       return '  ' + x.replace('\n', '\n  ')
+
     name_str = self._name
     n_in, n_out = self.n_in, self.n_out
     if n_in != 1: name_str += f'_in{n_in}'
     if n_out != 1: name_str += f'_out{n_out}'
-    objs = self.sublayers
+
     if self._sublayers_to_print is not None:
-      objs = self._sublayers_to_print
-    if objs:
-      objs_str = '\n'.join(indent_string(str(x)) for x in objs)
-      return f'{name_str}[\n{objs_str}\n]'
+      substructure = self._sublayers_to_print
+    else:
+      substructure = self.sublayers
+    if substructure:
+      substructure_str = '\n'.join(indent_string(str(x)) for x in substructure)
+      return f'{name_str}[\n{substructure_str}\n]'
     else:
       return name_str
 
@@ -178,11 +192,11 @@ class Layer:
   def forward(self, inputs):
     """Computes this layer's output as part of a forward pass through the model.
 
-    Authors of new layer subclasses should override this method to define the
-    forward computation that their layer performs. Use `self.weights` to access
-    trainable weights of this layer. If you need to use local non-trainable
-    state or randomness, use `self.rng` for the random seed (no need to set it)
-    and use `self.state` for non-trainable state (and set it to the new value).
+    A layer subclass overrides this method to define how the layer computes
+    outputs from inputs. If the layer depends on weights, state, or randomness
+    as part of the computation, the needed information can be accessed as
+    properties of the layer object: `self.weights`, `self.state`, and
+    `self.rng`. (See numerous examples in `trax.layers.core`.)
 
     Args:
       inputs: Zero or more input tensors, packaged as described in the `Layer`
@@ -195,16 +209,16 @@ class Layer:
     raise NotImplementedError
 
   def init_weights_and_state(self, input_signature):
-    """Initializes weights and state for inputs with the given signature.
+    """Initializes weights and state, to handle input with the given signature.
 
-    Authors of new layer subclasses should override this method if their layer
-    uses trainable weights or non-trainable state. To initialize trainable
-    weights, set `self.weights` and to initialize non-trainable state,
-    set `self.state` to the intended value.
+    A layer subclass must override this method if the layer uses weights or
+    state. To initialize weights, set `self.weights` to desired (typically
+    random) values. To initialize state (uncommon), set `self.state` to desired
+    starting values.
 
     Args:
       input_signature: A `ShapeDtype` instance (if this layer takes one input)
-          or a list/tuple of `ShapeDtype` instances; signatures of inputs.
+          or a list/tuple of `ShapeDtype` instances.
     """
     del input_signature
 
@@ -595,34 +609,6 @@ class Layer:
     return output, state
 
 
-def layer(n_in=1, n_out=1, name=None):
-  """Decorator for creating simple layers.  DEPRECATED; use base.Fn instead."""
-
-  def _build_layer_class(raw_fn):
-    """Returns a layer class whose callable instances execute the function."""
-
-    def _init(self, **kwargs):
-      self._kwargs = kwargs  # pylint: disable=protected-access
-      Layer.__init__(self, n_in=n_in, n_out=n_out, name=name)
-
-    def _forward(self, inputs):
-      """Uses this layer as part of a forward pass through the model."""
-      _validate_forward_input(inputs, n_in)
-      raw_output = raw_fn(inputs, **self._kwargs)  # pylint: disable=protected-access
-      output = () if _is_empty(raw_output) else raw_output
-      return output
-
-    # Set docstrings and create the class.
-    _forward.__doc__ = raw_fn.__doc__
-    # Note: None.__doc__ is None
-    cls = type(raw_fn.__name__, (Layer,),
-               {'__init__': _init,
-                'forward': _forward})
-    return cls
-
-  return _build_layer_class
-
-
 class PureLayer(Layer):
   """Pure function from inputs to outputs, packaged as neural network layer.
 
@@ -654,9 +640,6 @@ class PureLayer(Layer):
     Returns:
       Zero or more output tensors, packaged as described in the `Layer` class
       docstring.
-
-    Raises:
-      ValueError: If weights is other than an empty tuple/list.
     """
     _validate_forward_input(inputs, self.n_in)
     raw_output = self._forward_fn(inputs)
@@ -689,7 +672,6 @@ def Fn(name, f, n_out=1):  # pylint: disable=invalid-name
   Returns:
     Layer executing the function `f`.
   """
-  # Inspect the function f to restrict to no-defaults and no-kwargs functions.
   argspec = inspect.getfullargspec(f)
   if argspec.defaults is not None:
     raise ValueError('Function has default arguments (not allowed).')
@@ -750,7 +732,7 @@ def flatten_weights_and_state(weights, state):
 
 def unflatten_weights_and_state(
     flat_weights, flat_state, weights_and_state_signature, weights_only=False):
-  """Un-flatten weights and state given their signatures."""
+  """Unflatten weights and state given their signatures."""
   weights_tree, state_tree = weights_and_state_signature
   weights_to_copy = [EMPTY_WEIGHTS, GET_WEIGHTS_FROM_CACHE]
   weights, _ = fastmath.tree_unflatten(flat_weights, weights_tree,

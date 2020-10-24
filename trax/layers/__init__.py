@@ -14,7 +14,7 @@
 # limitations under the License.
 
 # Lint as: python3
-"""Layers defined in trax."""
+"""Layers: trainable functions as neural network building blocks."""
 
 import gin
 # We create a flat layers.* namespace for uniform calling conventions as we
@@ -73,6 +73,12 @@ DotProductCausalAttention = layer_configure(
 SelfAttention = layer_configure(SelfAttention, blacklist=['mode'])
 ModularCausalAttention = layer_configure(ModularCausalAttention,
                                          blacklist=['mode'])
+LowRankCausalAttention = layer_configure(LowRankCausalAttention,
+                                         blacklist=['mode'])
+MultiplicativeCausalAttention = layer_configure(MultiplicativeCausalAttention,
+                                                blacklist=['mode'])
+MultiplicativeModularCausalAttention = layer_configure(
+    MultiplicativeModularCausalAttention, blacklist=['mode'])
 LSHSelfAttention = layer_configure(LSHSelfAttention, blacklist=['mode'])
 EncDecAttention = layer_configure(EncDecAttention, blacklist=['mode'])
 
