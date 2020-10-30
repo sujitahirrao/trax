@@ -19,7 +19,7 @@
 import jax
 from trax import layers as tl
 from trax.fastmath import numpy as jnp
-from trax.models import transformer
+from trax.models.research import configurable_transformer as ct
 
 
 def Transformer2(input_vocab_size,
@@ -33,7 +33,19 @@ def Transformer2(input_vocab_size,
                  dropout_shared_axes=None,
                  max_len=2048,
                  mode='train',
-                 ff_activation=tl.Relu):
+                 ff_activation=tl.Relu,
+                 ff_dropout=0.1,
+                 ff_chunk_size=0,
+                 ff_use_sru=0,
+                 ff_sparsity=0,
+                 ff_sparsity_type='1inN',
+                 attention_chunk_size=0,
+                 encoder_attention_type=tl.Attention,
+                 n_encoder_attention_layers=1,
+                 decoder_attention_type=tl.CausalAttention,
+                 n_decoder_attention_layers=1,
+                 axial_pos_shape=None,
+                 d_axial_pos_embs=None):
   """Returns a Transformer model.
 
   This model expects an input pair: target, source.
@@ -52,38 +64,53 @@ def Transformer2(input_vocab_size,
     max_len: int: maximum symbol length for positional encoding
     mode: str: 'train' or 'eval'
     ff_activation: the non-linearity in feed-forward layer
+    ff_dropout: Stochastic rate (probability) for dropping an activation value
+      when applying dropout after the FF dense layer.
+    ff_chunk_size: int; if > 0, chunk feed-forward into this-sized chunks
+    ff_use_sru: int; if > 0, we use this many SRU layers instead of feed-forward
+    ff_sparsity: int, if > 0 use sparse feed-forward block with this sparsity
+    ff_sparsity_type: string, if ff_sparsity >0,
+      use SparseFF if ff_sparsity_type=`'1inN'` and
+      use BlockSparseFF if ff_sparsity_type=`'Block'`
+    attention_chunk_size: int, if > 0 run attention chunked at this size
+    encoder_attention_type: The attention layer to use for the encoder part.
+    n_encoder_attention_layers: int, within each encoder block, how many
+      attention layers to have.
+    decoder_attention_type: The attention layer to use for the
+      encoder-decoder attention.
+    n_decoder_attention_layers: int, within each decoder block, how many
+      attention layers to have.
+    axial_pos_shape: tuple of ints: input shape to use for the axial position
+      encoding. If unset, axial position encoding is disabled.
+    d_axial_pos_embs: tuple of ints: depth of position embedding for each axis.
+      Tuple length must match axial_pos_shape, and values must sum to d_model.
 
   Returns:
     A Transformer model as a layer that maps from a target, source pair to
     activations over a vocab set.
   """
-  def Embedder(vocab_size):  # tokens --> vectors
-    return [
-        tl.Embedding(vocab_size, d_model),
-        tl.Dropout(rate=dropout, shared_axes=dropout_shared_axes, mode=mode),
-    ]
+  in_encoder, out_encoder, output_vocab_size = (
+      ct.EmbeddingAndPositionalEncodings(
+          input_vocab_size,
+          d_model,
+          mode,
+          dropout,
+          dropout_shared_axes,
+          max_len,
+          output_vocab_size=output_vocab_size,
+          axial_pos_shape=axial_pos_shape,
+          d_axial_pos_embs=d_axial_pos_embs)
+  )
 
-  in_embedder = Embedder(input_vocab_size)
-  out_embedder = (in_embedder if output_vocab_size is None
-                  else Embedder(output_vocab_size))
-
-  # Positional encodings are not shared between encoder and decoder.
-  # Since encoder doesn't run stepwise, we do not use predict mode there.
-  encoder_mode = 'eval' if mode == 'predict' else mode
-  in_encoder = in_embedder + [
-      tl.PositionalEncoding(max_len=max_len, mode=encoder_mode)
-  ]
-  out_encoder = out_embedder + [
-      tl.PositionalEncoding(max_len=max_len, mode=mode)
-  ]
-
-  if output_vocab_size is None:
-    output_vocab_size = input_vocab_size
-
+  # pylint: disable=g-complex-comprehension
   encoder_blocks = [
-      transformer._EncoderBlock(d_model, d_ff, n_heads, dropout,  # pylint: disable=protected-access
-                                dropout_shared_axes, mode, ff_activation)
+      ct.EncoderBlock(d_model, d_ff, n_heads, dropout, dropout_shared_axes,
+                      mode, ff_activation, ff_dropout, ff_chunk_size,
+                      ff_use_sru, ff_sparsity, ff_sparsity_type,
+                      attention_chunk_size, encoder_attention_type,
+                      n_encoder_attention_layers)
       for i in range(n_encoder_layers)]
+  # pylint: enable=g-complex-comprehension
 
   encoder = tl.Serial(
       in_encoder,
@@ -93,12 +120,25 @@ def Transformer2(input_vocab_size,
   if mode == 'predict':
     encoder = tl.Cache(encoder)
 
+  # pylint: disable=g-complex-comprehension
   decoder_blocks = [
-      transformer._DecoderBlock(d_model, d_ff, n_heads, dropout,  # pylint: disable=protected-access
-                                dropout_shared_axes, mode, ff_activation)
+      ct.DecoderBlock(d_model, d_ff, n_heads, dropout, dropout_shared_axes,
+                      mode, ff_activation, ff_dropout, ff_chunk_size,
+                      ff_use_sru, ff_sparsity, ff_sparsity_type,
+                      attention_chunk_size, decoder_attention_type,
+                      n_decoder_attention_layers)
       for i in range(n_decoder_layers)]
 
-  # pylint: disable=protected-access
+  # Dont want FFNN in this block -- `n_feedforward_layers = 0`
+  decoder_blocks_sans_ff = [
+      ct.DecoderBlock(d_model, d_ff, n_heads, dropout, dropout_shared_axes,
+                      mode, ff_activation, ff_dropout, ff_chunk_size,
+                      ff_use_sru, ff_sparsity, ff_sparsity_type,
+                      attention_chunk_size, decoder_attention_type,
+                      n_decoder_attention_layers, n_feedforward_layers=0)
+      for i in range(n_decoder_layers)]
+  # pylint: enable=g-complex-comprehension
+
   # Assemble and return the model.
   return tl.Serial(
       # Input: encoder_side_tokens, decoder_side_tokens
@@ -118,6 +158,10 @@ def Transformer2(input_vocab_size,
       tl.Select([3, 1, 0, 2]),          #  tok_d vec_e mask_e tok_e tok_d
       tl.ShiftRight(mode=mode),         # stok_d vec_e mask_e tok_e tok_d
       out_encoder,                      # svec_d vec_e mask_e tok_e tok_d
+
+      # Causal attention and LN only on the decoder tokens.
+      decoder_blocks_sans_ff,           # svec_d vec_e mask_e tok_e tok_d
+      tl.LayerNorm(),                   # svec_d vec_e mask_e tok_e tok_d
 
       # Concat encoder and decoder.
       tl.Select([1, 0]),                # vec_e svec_d mask_e tok_e tok_d
