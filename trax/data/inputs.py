@@ -374,6 +374,74 @@ def FilterByLength(max_length,  # pylint: disable=invalid-name
   return filtered
 
 
+def ConcatenateToLMInput(pad_to_length=None):  # pylint: disable=invalid-name
+  """Prepares the input needed for training of Language Models.
+
+  Each example needs to contain two elements (input and target).
+  Input is concatenated to target and, if pad_to_length is given, padded to
+  length provided.
+  The loss_weights indicates only the target, without input nor padding.
+
+  Args:
+    pad_to_length: int, total length of padding of input and target arrays.
+  Returns:
+    Function to return input for a LM.
+  """
+  def _concatenate_to_lm_input(generator, pad_to_length=None):
+    for example in generator:
+      if len(example) != 2:
+        raise ValueError('Examples must have exactly 2 elements.')
+      concatenated = np.concatenate((example[0], example[1]), axis=-1)
+      loss_weights = np.concatenate((np.zeros_like(example[0]),
+                                     np.ones_like(example[1])))
+      if pad_to_length is not None:
+        padding_len = pad_to_length-(example[0].shape[0] + example[1].shape[0])
+        if padding_len < 0:
+          raise ValueError(
+              f'Example lengths ({example[0].shape[0]}, {example[1].shape[0]}) '
+              f'longer than pad_to_length ({pad_to_length}).')
+        loss_weights = np.pad(loss_weights, (0, padding_len), 'constant')
+        concatenated = np.pad(concatenated, (0, padding_len), 'constant')
+      yield (concatenated, concatenated, loss_weights)
+  return lambda g: _concatenate_to_lm_input(g, pad_to_length)
+
+
+def PadToLength(  # pylint: disable=invalid-name
+    len_map=None, pad_value=0, multiple=False):
+  """Pads the values to lengths given in `len_map'.
+
+  len_map contains a dictionary of example keys to dimension sizes.
+
+  Args:
+    len_map: dict of int to int, we pad examples to lengths
+      given by the values of the dict. If multiple is True, the dimensions are
+      padded to multiple of this value.
+    pad_value: dict of int to int. The value gets applied to
+      constant_values on numpy.pad per given dimension.
+    multiple: boolean. If False, pads to the value of len_map. If True, pads to
+      closest multiple of value of len_map.
+  Returns:
+    Function to pad examples to given lengths.
+  """
+  def _pad_to_length(generator, len_map=None, pad_value=0, multiple=False):
+    for example in generator:
+      example = list(example)
+      for key, value in len_map.items():
+        array_length = example[key].shape[0]
+        if multiple:
+          padding_len = array_length - ((array_length // value) * value)
+        else:
+          padding_len = max([0, value-example[key].shape[0]])
+        example[key] = np.pad(example[key],
+                              pad_width=(0, padding_len),
+                              mode='constant',
+                              constant_values=pad_value[key])
+      yield tuple(example)
+  if len_map is None:
+    raise ValueError('len_map parameter should be provided.')
+  return lambda g: _pad_to_length(g, len_map, pad_value, multiple)
+
+
 def _append_value(generator, val=None):
   for example in generator:
     example = list(example)

@@ -127,6 +127,48 @@ class InputsTest(parameterized.TestCase):
     padded4 = data.inputs.pad_to_max_dims(tensors4, 12)
     self.assertEqual(padded4.shape, (2, 4, 12))
 
+  def test_pad_to_length(self):
+    tensors1 = [(np.zeros((5)), np.ones((3)))]
+    pad_to_length_function1 = data.inputs.PadToLength(len_map={0: 10,
+                                                               1: 11},
+                                                      pad_value={0: 0,
+                                                                 1: 1})
+    padded1 = next(pad_to_length_function1(tensors1))
+    self.assertEqual(padded1[0].shape, (10,))
+    self.assertEqual(padded1[1].shape, (11,))
+
+    tensors2 = [(np.zeros((15)), np.ones((20)))]
+    pad_to_length_function2 = data.inputs.PadToLength(len_map={0: 10,
+                                                               1: 10},
+                                                      pad_value={0: 0,
+                                                                 1: 1},
+                                                      multiple=True)
+    padded2 = next(pad_to_length_function2(tensors2))
+    self.assertEqual(padded2[0].shape, (20,))
+    self.assertEqual(padded2[1].shape, (20,))
+
+  def test_concatenate_lm_input(self):
+    tensors1 = [(np.zeros((5)), np.ones((3)))]
+
+    lm_input_function1 = data.inputs.ConcatenateToLMInput(pad_to_length=10)
+    lm_input_1 = next(lm_input_function1(tensors1))
+    self.assertEqual(lm_input_1[0].shape, (10,))
+    self.assertEqual(lm_input_1[1].shape, (10,))
+    self.assertEqual(lm_input_1[2].shape, (10,))
+    self.assertEqual(lm_input_1[2].all(),
+                     np.array([[0., 0., 0., 0., 0.,
+                                1., 1., 1., 0., 0.]]).all())
+
+    tensors2 = [(np.zeros((5)), np.ones((3)))]
+    lm_input_function2 = data.inputs.ConcatenateToLMInput()
+    lm_input_2 = next(lm_input_function2(tensors2))
+    self.assertEqual(lm_input_2[0].shape, (8,))
+    self.assertEqual(lm_input_2[1].shape, (8,))
+    self.assertEqual(lm_input_2[2].shape, (8,))
+    self.assertEqual(lm_input_2[2].all(),
+                     np.array([[0., 0., 0., 0., 0.,
+                                1., 1., 1.]]).all())
+
   def test_truncate_to_length(self):
     tensors1 = [(np.zeros((1, 5)), np.ones((1, 5)))]
 

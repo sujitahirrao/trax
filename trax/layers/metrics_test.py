@@ -98,20 +98,8 @@ class MetricsTest(absltest.TestCase):
     y = layer(xs)
     self.assertEqual(y.shape, ())
 
-  def test_binary_classifier(self):
-    layer = metrics.BinaryClassifier()
-    xs = [np.ones((9, 1))]
-    y = layer(xs)
-    self.assertEqual(y.shape, (9, 1))
-
-  def test_multiclass_classifier(self):
-    layer = metrics.MulticlassClassifier()
-    xs = [np.ones((9, 4, 4, 20))]
-    y = layer(xs)
-    self.assertEqual(y.shape, (9, 4, 4))
-
   def test_accuracy_binary_scalar(self):
-    layer = tl.Accuracy(classifier=tl.BinaryClassifier())
+    layer = tl.Accuracy(classifier=tl.ThresholdToBinary())
     xs = [np.ones((9, 1)),
           np.ones((9, 1)),
           np.ones((9, 1))]
@@ -119,7 +107,7 @@ class MetricsTest(absltest.TestCase):
     self.assertEqual(y.shape, ())
 
   def test_accuracy_multiclass_scalar(self):
-    layer = tl.Accuracy(classifier=tl.MulticlassClassifier())
+    layer = tl.Accuracy(classifier=tl.ArgMax())
     xs = [np.ones((9, 4, 4, 20)),
           np.ones((9, 4, 4)),
           np.ones((9, 4, 4))]
@@ -187,10 +175,6 @@ class MetricsTest(absltest.TestCase):
   def test_names(self):
     layer = tl.L2Loss()
     self.assertEqual('L2Loss_in3', str(layer))
-    layer = tl.BinaryClassifier()
-    self.assertEqual('BinaryClassifier', str(layer))
-    layer = tl.MulticlassClassifier()
-    self.assertEqual('MulticlassClassifier', str(layer))
     layer = tl.Accuracy()
     self.assertEqual('Accuracy_in3', str(layer))
     layer = tl.SequenceAccuracy()
