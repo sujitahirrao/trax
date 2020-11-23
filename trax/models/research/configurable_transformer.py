@@ -66,7 +66,8 @@ def FeedForwardWithOptions(d_model,
       when applying dropout after the FF dense layer.
     ff_chunk_size: int; if > 0, chunk feed-forward into this-sized chunks
     ff_use_sru: int; if > 0, we use this many SRU layers instead of feed-forward
-    ff_sparsity: int, if > 0 use sparse feed-forward block with this sparsity
+    ff_sparsity: int, tuple or string; if not 0, use sparse feed-forward block
+      with this sparsity
     mode: If `'train'`, each block will include dropout; else, it will pass all
       values through unaltered.
     use_bfloat16: whether to use bfloat16 for weights (default: False).
@@ -78,8 +79,16 @@ def FeedForwardWithOptions(d_model,
     A list of layers which maps vectors to vectors.
   """
   if ff_sparsity and ff_sparsity_type == '1inN':
-    if isinstance(ff_sparsity, tuple):
-      n_elements_in_block, d_lowrank = ff_sparsity
+    temperature, quant_prob = 0.1, 0.3
+    if isinstance(ff_sparsity, str):
+      # This is hacky but used to pass ff_sparsity in yaml sweep files.
+      ff_sparsity = [(float(x) if '.' in x else int(x))
+                     for x in ff_sparsity.split()]
+    if isinstance(ff_sparsity, (list, tuple)):
+      if len(ff_sparsity) == 2:
+        n_elements_in_block, d_lowrank = ff_sparsity
+      else:
+        n_elements_in_block, d_lowrank, temperature, quant_prob = ff_sparsity
     else:
       assert isinstance(ff_sparsity, int)
       n_elements_in_block, d_lowrank = ff_sparsity, d_ff // ff_sparsity
@@ -87,6 +96,8 @@ def FeedForwardWithOptions(d_model,
         d_ff,
         n_elements_in_block=n_elements_in_block,
         d_lowrank=d_lowrank,
+        temperature=temperature,
+        quant_prob=quant_prob,
         mode=mode)
   elif ff_sparsity and ff_sparsity_type == 'Block':
     ff = tl.BlockSparseFF(d_ff, num_experts=ff_sparsity, mode=mode),
@@ -126,7 +137,8 @@ def ApplyAttentionLayer(attention_type, d_model, n_heads, d_qk, d_v, causal,
 
 
 def PositionalEncoder(mode, dropout=None, max_len=None,
-                      axial_pos_shape=None, d_axial_pos_embs=None):
+                      axial_pos_shape=None, d_axial_pos_embs=None,
+                      use_bfloat16=False):
   """Returns the positional encoding layer depending on the arguments.
 
   Args:
@@ -140,6 +152,8 @@ def PositionalEncoder(mode, dropout=None, max_len=None,
       encoding. If unset, axial position encoding is disabled.
     d_axial_pos_embs: tuple of ints: depth of position embedding for each axis.
       Tuple length must match axial_pos_shape, and values must sum to d_model.
+    use_bfloat16: If `True`, use bfloat16 weights instead of the default
+      float32; this can save memory but may (rarely) lead to numerical issues.
 
   Returns:
     A layer that will do the positional encoding.
@@ -147,7 +161,7 @@ def PositionalEncoder(mode, dropout=None, max_len=None,
 
   if not axial_pos_shape:
     positional_encoding = tl.PositionalEncoding(
-        max_len=max_len, dropout=dropout, mode=mode)
+        max_len=max_len, dropout=dropout, mode=mode, use_bfloat16=use_bfloat16)
   elif axial_pos_shape == 'fixed-base':  # TODO(lukaszkaiser): remove this HACK
     positional_encoding = tl.FixedBasePositionalEncoding(mode=mode)
   elif axial_pos_shape == 'infinite':  # TODO(lukaszkaiser): remove this HACK
@@ -175,7 +189,8 @@ def EmbeddingAndPositionalEncodings(input_vocab_size,
                                     max_len,
                                     output_vocab_size=None,
                                     axial_pos_shape=None,
-                                    d_axial_pos_embs=None):
+                                    d_axial_pos_embs=None,
+                                    use_bfloat16=False):
   """Returns the embedder and positional encoder.
 
   Args:
@@ -201,15 +216,20 @@ def EmbeddingAndPositionalEncodings(input_vocab_size,
       encoding. If unset, axial position encoding is disabled.
     d_axial_pos_embs: tuple of ints: depth of position embedding for each axis.
       Tuple length must match axial_pos_shape, and values must sum to d_model.
+    use_bfloat16: If `True`, use bfloat16 weights instead of the default
+      float32; this can save memory but may (rarely) lead to numerical issues.
 
   Returns:
     A tuple of (input encoder, output encoder, output vocab size used).
   """
   # tokens --> vectors
   def Embedder(vocab_size, embedding_mode):
+    if vocab_size is not None:
+      embedding = tl.Embedding(vocab_size, d_model, use_bfloat16=use_bfloat16)
+    else:
+      embedding = tl.Dense(d_model, use_bfloat16=use_bfloat16)
     return [
-        (tl.Embedding(vocab_size, d_model) if vocab_size is not None
-         else tl.Dense(d_model)),
+        embedding,
         tl.Dropout(rate=embedding_dropout,
                    shared_axes=dropout_shared_axes,
                    mode=embedding_mode),
@@ -225,7 +245,8 @@ def EmbeddingAndPositionalEncodings(input_vocab_size,
                         dropout=embedding_dropout,
                         max_len=max_len,
                         axial_pos_shape=axial_pos_shape,
-                        d_axial_pos_embs=d_axial_pos_embs)
+                        d_axial_pos_embs=d_axial_pos_embs,
+                        use_bfloat16=use_bfloat16)
   ]
 
   # If output_vocab_size is None, we reuse the same embedding matrix, otherwise
@@ -240,7 +261,8 @@ def EmbeddingAndPositionalEncodings(input_vocab_size,
                         dropout=embedding_dropout,
                         max_len=max_len,
                         axial_pos_shape=axial_pos_shape,
-                        d_axial_pos_embs=d_axial_pos_embs)
+                        d_axial_pos_embs=d_axial_pos_embs,
+                        use_bfloat16=use_bfloat16)
   ]
 
   # Set this to the value actually used.
@@ -354,7 +376,6 @@ def ConfigurableTransformerEncoder(vocab_size,
       # Map to output categories.
       tl.Mean(axis=1),                            # vecs
       tl.Dense(n_classes),                        # vecs
-      tl.LogSoftmax(),                            # vecs
   )
 
 
@@ -457,7 +478,6 @@ def ConfigurableTransformerLM(vocab_size,
       decoder_blocks,            # vecs
       tl.LayerNorm(),            # vecs
       tl.Dense(vocab_size),      # vecs
-      tl.LogSoftmax(),           # vecs
   )
 
 
@@ -613,7 +633,6 @@ def ConfigurableTransformer(input_vocab_size,
       # Map to output vocab.
       tl.Select([0], n_in=3),             # vec_d tok_d
       tl.Dense(output_vocab_size),        # vec_d .....
-      tl.LogSoftmax(),                    # vec_d .....
   )
 
 

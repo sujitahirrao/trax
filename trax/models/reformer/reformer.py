@@ -164,7 +164,6 @@ def ReformerLM(vocab_size,
       tl.LayerNorm(),
       tl.Dropout(rate=dropout, shared_axes=[-2], mode=mode),  # pylint: disable=no-value-for-parameter
       tl.Dense(vocab_size),
-      tl.LogSoftmax(),
   )
 
 
@@ -289,7 +288,6 @@ def ReformerShortenLM(vocab_size,
       tl.Relu(),
       tl.SRU(d_embedding),  # One RNN layer for conditional dependence.
       tl.Dense(vocab_size),
-      tl.LogSoftmax()
   )
   # pylint: enable=g-long-lambda
 
@@ -532,7 +530,6 @@ def Reformer(input_vocab_size,
       # Map to output vocab.
       tl.Select([0], n_in=3),               # vec_d .....
       tl.Dense(output_vocab_size),          # vec_d .....
-      tl.LogSoftmax(),                      # vec_d .....
   )
 
 
@@ -625,7 +622,8 @@ def Reformer2(input_vocab_size,
           max_len,
           output_vocab_size=output_vocab_size,
           axial_pos_shape=axial_pos_shape,
-          d_axial_pos_embs=d_axial_pos_embs)
+          d_axial_pos_embs=d_axial_pos_embs,
+          use_bfloat16=use_bfloat16)
   )
 
   # pylint: disable=g-complex-comprehension
@@ -648,7 +646,7 @@ def Reformer2(input_vocab_size,
       tl.Dup(),                        # vec_e1 vec_e2 mask_e tok_e tok_d tok_d
       _ReversibleSerialForget(encoder_blocks, d_model, n_layers_forget),
       tl.Fn('XYAvg', lambda x, y: (x + y) / 2.0),
-      tl.Dense(d_model),
+      tl.Dense(d_model, use_bfloat16=use_bfloat16),
       tl.LayerNorm(),
   ])
   if mode == 'predict':
@@ -716,8 +714,7 @@ def Reformer2(input_vocab_size,
       t2.StripFromConcatenateWithPadding(mode=mode),  # vec_d tok_d
 
       # Map to output vocab.
-      tl.Dense(output_vocab_size),                 # vec_d tok_d
-      tl.LogSoftmax(),                             # vec_d tok_d
+      tl.Dense(output_vocab_size, use_bfloat16=use_bfloat16),  # vec_d tok_d
   )
 
 
