@@ -23,6 +23,7 @@ import time
 
 from absl import logging
 import jax
+import numpy as np
 import psutil
 
 from trax import fastmath
@@ -375,18 +376,22 @@ class ReversibleSerialTrainer:
     step_int = step
     if self._n_devices > 1:
       batch = tl.reshape_by_device(batch, self._n_devices)
-      step = jnp.repeat(step, self._n_devices)
+      step = np.repeat(step, self._n_devices)
 
     # Create separate rng for each device and layer.
     if self._n_devices == 1:
       rngs = fastmath.random.split(rng, self._n_layers)
     else:
       # Splitting by device first to be identical with default trainer.
-      per_device_rng = fastmath.random.split(rng, self._n_devices)
-      per_device_rngs = [
-          fastmath.random.split(r, self._n_layers) for r in per_device_rng]
-      rngs = [jnp.stack([r[i] for r in per_device_rngs])
-              for i in range(self._n_layers)]
+      def per_device_rngs(rng):  # A function to JIT to not fragment memory.
+        per_device_rng = fastmath.random.split(rng, self._n_devices)
+        per_device_rngs = [
+            fastmath.random.split(r, self._n_layers) for r in per_device_rng]
+        rngs = [jnp.stack([r[i] for r in per_device_rngs])
+                for i in range(self._n_layers)]
+        return rngs
+      # JIT the function and run it on CPU to avoid memory fragmentation.
+      rngs = fastmath.jit(per_device_rngs, backend='cpu')(tl.on_cpu(rng))
     # Group rngs by layer blocks.
     rng_blocks, rng_i = [], 0
     for _, rev_layers in self._blocks:
@@ -396,6 +401,7 @@ class ReversibleSerialTrainer:
 
     # Run the layers forward upto the loss layer.
     process = psutil.Process(os.getpid())
+    logging.info('running step %d', step_int)
     if step_int % self._n_steps_per_log == 1:
       logging.info('run fwd: cpu memory use (MB): %.2f',
                    process.memory_info().rss / float(1024 * 1024))
@@ -667,17 +673,26 @@ def extract_reversible_blocks(layers, loss_chunk_size=0):
   if loss_chunk_size > 0:
     # For now we only do chunking of [Dense, LogSoftmax, CrossEntopy, Mean]
     # Let's check that these are the last 4 layers.
-    if len(std_layers) < 4:
+    border_layers = ['StripFromConcatenateWithPadding', 'Select']
+
+    loss_start = None
+    for index, layer in enumerate(std_layers):
+      if layer.name in border_layers:
+        loss_start = index + 1
+    if loss_start is None:
+      raise ValueError('Loss layer should be preceeded by one of {}; got {}'
+                       .format(border_layers, [l.name for l in std_layers]))
+    if len(std_layers) - loss_start < 4:
       raise ValueError('Too short loss layer for chunking')
-    # To check for Dense, remove the n_units part from name.
-    name4 = std_layers[-4].name[:5]  # Just 'Dense' not e.g., 'Dense_32000'.
-    last_4_names = ' '.join([name4] + [l.name for l in std_layers[-3:]])
-    if last_4_names != 'Dense LogSoftmax _CrossEntropy _WeightedMean':
-      raise ValueError('Loss chunking only works with last layers being "Dense'
-                       ' LogSoftmax, _CrossEntropy, _WeightedMean" but got: ' +
-                       last_4_names)
+    last_3_names = ' '.join([l.name for l in std_layers[-3:]])
+    if last_3_names != 'LogSoftmax _CrossEntropy _WeightedMean':
+      raise ValueError('Loss chunking only works with last layers being "'
+                       'LogSoftmax, _CrossEntropy, _WeightedMean" but got: ' +
+                       last_3_names)
+
     # Create chunked dense+logsoftmax+cross-entropy-loss.
-    chunked_xent = tl.Chunk(tl.Serial(std_layers[-4:-1]), loss_chunk_size)
+    chunked_xent = tl.Chunk(tl.Serial(std_layers[loss_start:-1]),
+                            loss_chunk_size)
     # The chunked loss should operate on a merged batch dimension, e.g.,
     # including both length and batch size. Need to merge and un-merge later.
     def _reshape_to_batch_and_copy_targets(preds, targets):
@@ -691,7 +706,8 @@ def extract_reversible_blocks(layers, loss_chunk_size=0):
         chunked_xent,
         tl.Fn('after_xent_rebatch', _reshape_xent_back)
     )
-    loss_layer = tl.Serial(std_layers[:-4] + [batched_xent], std_layers[-1])
+    loss_layer = tl.Serial(std_layers[:loss_start] + [batched_xent],
+                           std_layers[-1])
   else:
     loss_layer = tl.Serial(std_layers)
   return blocks, loss_layer

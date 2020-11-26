@@ -65,7 +65,8 @@ def FeedForwardWithOptions(d_model,
     ff_dropout: Stochastic rate (probability) for dropping an activation value
       when applying dropout after the FF dense layer.
     ff_chunk_size: int; if > 0, chunk feed-forward into this-sized chunks
-    ff_use_sru: int; if > 0, we use this many SRU layers instead of feed-forward
+    ff_use_sru: int or pair of ints; if > 0, we use this many SRU layers
+      in addition to the feed-forward block (second int specifies sru size)
     ff_sparsity: int, tuple or string; if not 0, use sparse feed-forward block
       with this sparsity
     mode: If `'train'`, each block will include dropout; else, it will pass all
@@ -98,6 +99,7 @@ def FeedForwardWithOptions(d_model,
         d_lowrank=d_lowrank,
         temperature=temperature,
         quant_prob=quant_prob,
+        use_bfloat16=use_bfloat16,
         mode=mode)
   elif ff_sparsity and ff_sparsity_type == 'Block':
     ff = tl.BlockSparseFF(d_ff, num_experts=ff_sparsity, mode=mode),
@@ -110,8 +112,12 @@ def FeedForwardWithOptions(d_model,
   if ff_chunk_size > 0:
     res = tl.BatchLeadingAxes(tl.Chunk(tl.Serial(res), ff_chunk_size))
   if ff_use_sru:
-    sru = [tl.Dense(32)] + [tl.SRU(32) for _ in range(ff_use_sru)]
-    res = tl.Residual(sru + [tl.Dense(d_model)], res)
+    if isinstance(ff_use_sru, (list, tuple)):
+      sru_n_layers, sru_n_units = ff_use_sru
+    else:
+      sru_n_layers, sru_n_units = ff_use_sru, 32
+    sru = [tl.SRU(sru_n_units) for _ in range(sru_n_layers)]
+    res = tl.Residual([tl.Dense(sru_n_units)] + sru + [tl.Dense(d_model)], res)
   return [res]
 
 
@@ -331,7 +337,8 @@ def ConfigurableTransformerEncoder(vocab_size,
     ff_dropout: Stochastic rate (probability) for dropping an activation value
       when applying dropout after the FF dense layer.
     ff_chunk_size: int; if > 0, chunk feed-forward into this-sized chunks
-    ff_use_sru: int; if > 0, we use this many SRU layers instead of feed-forward
+    ff_use_sru: int or pair of ints; if > 0, we use this many SRU layers
+      in addition to the feed-forward block (second int specifies sru size)
     ff_sparsity: int, if > 0 use sparse feed-forward block with this sparsity
     ff_sparsity_type: string, if ff_sparsity >0,
       use SparseFF if ff_sparsity_type=`'1inN'` and
@@ -394,6 +401,10 @@ def ConfigurableTransformerLM(vocab_size,
                               ff_use_sru=0,
                               ff_sparsity=0,
                               ff_sparsity_type='1inN',
+                              loss_sparsity_type='mult',
+                              loss_sparsity=0,
+                              loss_d_lowrank=0,
+                              loss_sparsity_prob=None,
                               attention_chunk_size=0,
                               attention_type=tl.CausalAttention,
                               axial_pos_shape=None,
@@ -438,11 +449,18 @@ def ConfigurableTransformerLM(vocab_size,
     ff_dropout: Stochastic rate (probability) for dropping an activation value
       when applying dropout after the FF dense layer.
     ff_chunk_size: int; if > 0, chunk feed-forward into this-sized chunks
-    ff_use_sru: int; if > 0, we use this many SRU layers instead of feed-forward
+    ff_use_sru: int or pair of ints; if > 0, we use this many SRU layers
+      in addition to the feed-forward block (second int specifies sru size)
     ff_sparsity: int, if > 0 use sparse feed-forward block with this sparsity
     ff_sparsity_type: string, if ff_sparsity >0,
       use SparseFF if ff_sparsity_type=`'1inN'` and
       use BlockSparseFF if ff_sparsity_type=`'Block'`
+    loss_sparsity_type: string, type of sparsity to used in loss layer. See
+      SparseDenseWithOptions for options. None if no sparsity should be used.
+    loss_sparsity: int, the sparsity for loss layer (if used)
+    loss_d_lowrank: int, the dimensions for intermediate layer (if used)
+    loss_sparsity_prob: float, the probability for sparse version of loss to be
+      used. If None, only sparse version is used.
     attention_chunk_size: int, if > 0 run attention chunked at this size
     attention_type: The attention layer to use for the decoder part.
     axial_pos_shape: tuple of ints: input shape to use for the axial position
@@ -472,12 +490,15 @@ def ConfigurableTransformerLM(vocab_size,
   # pylint: enable=g-complex-comprehension
 
   # Assemble and return the model.
-  return tl.Serial(              # tokens (or chunked tuple of tokens)
-      tl.ShiftRight(mode=mode),  # toks
-      positional_encoder,        # vecs
-      decoder_blocks,            # vecs
-      tl.LayerNorm(),            # vecs
-      tl.Dense(vocab_size),      # vecs
+  return tl.Serial(               # tokens (or chunked tuple of tokens)
+      tl.ShiftRight(mode=mode),   # toks
+      positional_encoder,         # vecs
+      decoder_blocks,             # vecs
+      tl.LayerNorm(),             # vecs
+      tl.SparseDenseWithOptions(  # vecs
+          vocab_size, d_input=d_model, sparsity_type=loss_sparsity_type,
+          sparsity=loss_sparsity, d_lowrank=loss_d_lowrank,
+          prob_sparse=loss_sparsity_prob, mode=mode),
   )
 
 
@@ -498,6 +519,10 @@ def ConfigurableTransformer(input_vocab_size,
                             ff_use_sru=0,
                             ff_sparsity=0,
                             ff_sparsity_type='1inN',
+                            loss_sparsity_type='mult',
+                            loss_sparsity=0,
+                            loss_d_lowrank=0,
+                            loss_sparsity_prob=None,
                             attention_chunk_size=0,
                             encoder_attention_type=tl.Attention,
                             encoder_decoder_attention_type=tl.CausalAttention,
@@ -556,11 +581,18 @@ def ConfigurableTransformer(input_vocab_size,
     ff_dropout: Stochastic rate (probability) for dropping an activation value
       when applying dropout after the FF dense layer.
     ff_chunk_size: int; if > 0, chunk feed-forward into this-sized chunks
-    ff_use_sru: int; if > 0, we use this many SRU layers instead of feed-forward
+    ff_use_sru: int or pair of ints; if > 0, we use this many SRU layers
+      in addition to the feed-forward block (second int specifies sru size)
     ff_sparsity: int, if > 0 use sparse feed-forward block with this sparsity
     ff_sparsity_type: string, if ff_sparsity >0,
       use SparseFF if ff_sparsity_type=`'1inN'` and
       use BlockSparseFF if ff_sparsity_type=`'Block'`
+    loss_sparsity_type: str, type of sparsity to used in loss layer. See
+      SparseDenseWithOptions for options. None if no sparsity should be used.
+    loss_sparsity: int, the sparsity for loss layer (if used)
+    loss_d_lowrank: int, the dimensions for intermediate layer (if used)
+    loss_sparsity_prob: float, the probability for sparse version of loss to be
+      used. If None, only sparse version is used.
     attention_chunk_size: int, if > 0 run attention chunked at this size
     encoder_attention_type: The attention layer to use for the encoder part.
     encoder_decoder_attention_type: The attention layer to use for the
@@ -632,7 +664,10 @@ def ConfigurableTransformer(input_vocab_size,
 
       # Map to output vocab.
       tl.Select([0], n_in=3),             # vec_d tok_d
-      tl.Dense(output_vocab_size),        # vec_d .....
+      tl.SparseDenseWithOptions(          # vec_d .....
+          output_vocab_size, d_input=d_model, sparsity_type=loss_sparsity_type,
+          sparsity=loss_sparsity, d_lowrank=loss_d_lowrank,
+          prob_sparse=loss_sparsity_prob, mode=mode),
   )
 
 
@@ -676,7 +711,8 @@ def EncoderBlock(d_model,
     ff_dropout: Stochastic rate (probability) for dropping an activation value
       when applying dropout after the FF dense layer.
     ff_chunk_size: int; if > 0, chunk feed-forward into this-sized chunks
-    ff_use_sru: int; if > 0, we use this many SRU layers instead of feed-forward
+    ff_use_sru: int or pair of ints; if > 0, we use this many SRU layers
+      in addition to the feed-forward block (second int specifies sru size)
     ff_sparsity: int, if > 0 use sparse feed-forward block with this sparsity
     ff_sparsity_type: string, if ff_sparsity >0,
       use SparseFF if ff_sparsity_type=`'1inN'` and
@@ -764,7 +800,8 @@ def DecoderBlock(d_model,
     ff_dropout: Stochastic rate (probability) for dropping an activation value
       when applying dropout after the FF dense layer.
     ff_chunk_size: int; if > 0, chunk feed-forward into this-sized chunks
-    ff_use_sru: int; if > 0, we use this many SRU layers instead of feed-forward
+    ff_use_sru: int or pair of ints; if > 0, we use this many SRU layers
+      in addition to the feed-forward block (second int specifies sru size)
     ff_sparsity: int, if > 0 use sparse feed-forward block with this sparsity
     ff_sparsity_type: string, if ff_sparsity >0,
       use SparseFF if ff_sparsity_type=`'1inN'` and
@@ -841,7 +878,8 @@ def EncoderDecoderBlock(d_model, d_ff, n_heads, dropout, dropout_shared_axes,
     ff_dropout: Stochastic rate (probability) for dropping an activation value
       when applying dropout after the FF dense layer.
     ff_chunk_size: int; if > 0, chunk feed-forward into this-sized chunks
-    ff_use_sru: int; if > 0, we use this many SRU layers instead of feed-forward
+    ff_use_sru: int or pair of ints; if > 0, we use this many SRU layers
+      in addition to the feed-forward block (second int specifies sru size)
     ff_sparsity: int, if > 0 use sparse feed-forward block with this sparsity
      ff_sparsity_type: string, if ff_sparsity >0,
       use SparseFF if ff_sparsity_type=`'1inN'` and
