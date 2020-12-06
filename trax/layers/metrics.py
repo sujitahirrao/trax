@@ -16,40 +16,176 @@
 # Lint as: python3
 """Layers for computing loss functions and evaluation metrics.
 
-A metric layer computes a scalar value from three tensor inputs:
+A metric layer computes a scalar value from two or three ndarray inputs:
 
-  - model output: Batch of predicted values (typically vectors).
+  - model outputs: Batch of predicted values (typically vectors).
+
   - targets: Batch of target values (e.g., categories or vectors).
-  - weights: Tensor that can assign different weights to different positions
-    in the model output. One common use of weights is for masking -- assigning
-    weight 0 to positions that correspond to padding in the input so that they
-    don't affect metrics.
 
-Metric computations take into account the items that make up a batch. For each
-item in a batch, a raw metric value is computed by comparing (item-wise) the
-model output to the target value. These item-wise values are then combined into
-a single scalar for the batch by a weighted reduction function, typically
-weighted mean. For example:
+  - weights: Float values that allow for uneven weighting of batch items,
+    sequence positions, or vector components when computing an overall scalar
+    value for the batch.
 
-  - Accuracy: Treat model output as giving different strength/votes to the
-    possible categories; measure the category prediction as correct (value 1)
-    if `argmax(output) == target_category`, else as incorrect (value 0). The
-    accuracy for the batch is then the weighted mean of these 1's and 0's.
+Most metric computations take into account the items that make up a batch. For
+each item in a batch, a raw metric value is computed by comparing (item-wise)
+the model output to the target value. These item-wise values are then combined
+into a single scalar for the batch by a function such as sum, average, or
+weighted-average. For example:
 
-  - Cross Entropy: Treat model output and target values as two probability
-    distributions; measure the cross entropy of the model output relative to
-    the (assumed true) target distribution. The scalar value for the batch is
-    then the weighted mean of the item-wise cross-entropy values.
+  - CategoryAccuracy: Treat model output as giving different strength/votes to
+    the possible categories; measure the category prediction as correct (value
+    1) if `argmax(output) == target_category`, else as incorrect (value 0). The
+    accuracy for the batch is then the average of these 1's and 0's.
 
-In deriving a single scalar for the batch, there is flexibility to use reducing
-functions other than mean, for instance sum or a specialized sequence mean.
+  - CategoryCrossEntropy: Treat model output and target values as the source of
+    two probability distributions; measure the cross entropy of the model's
+    predicted distribution relative to the (assumed true) target distribution.
+    The scalar value for the batch is then the average of the item-wise
+    cross-entropy values.
 """
 
 from trax import shapes
 from trax.fastmath import numpy as jnp
+from trax.layers import base
 from trax.layers import combinators as cb
 from trax.layers import core
-from trax.layers.base import Fn
+
+
+def CategoryAccuracy():
+  """Returns a layer that computes category prediction accuracy.
+
+  The layer takes two inputs:
+
+    - A batch of activation vectors. The components in a given vector should
+      be mappable to a probability distribution in the following loose sense:
+      within a vector, a higher component value corresponds to a higher
+      probability, such that argmax within a vector (`axis=-1`) picks the index
+      (category) having the highest probablity.
+
+    - A batch of target categories; each target is an integer in
+      `{0, ..., N-1}`.
+
+  The predicted category from each vector is the index of the highest-valued
+  vector component. The layer returns the accuracy of these predictions
+  averaged over the batch.
+  """
+  def f(model_output, targets):  # pylint: disable=invalid-name
+    predictions = jnp.argmax(model_output, axis=-1)
+    shapes.assert_same_shape(predictions, targets)
+    n_total = predictions.size
+    n_correct = jnp.sum(jnp.equal(predictions, targets))
+    return n_correct / n_total
+
+  return base.Fn('CategoryAccuracy', f)
+
+
+def WeightedCategoryAccuracy():
+  """Returns a layer that computes a weighted category prediction accuracy.
+
+  The layer takes three inputs:
+
+    - A batch of activation vectors. The components in a given vector should
+      be mappable to a probability distribution in the following loose sense:
+      within a vector, a higher component value corresponds to a higher
+      probability, such that argmax within a vector (`axis=-1`) picks the index
+      (category) having the highest probablity.
+
+    - A batch of target categories; each target is an integer in
+      `{0, ..., N-1}`.
+
+    - A batch of weights, which matches or can be broadcast to match the shape
+      of the target ndarray. This arg can give uneven weighting to different
+      items in the batch (depending, for instance, on the item's target
+      category).
+
+  The predicted category from each vector is the index of the highest-valued
+  vector component. The layer returns a weighted average accuracy of these
+  predictions.
+  """
+  def f(model_output, targets, weights):  # pylint: disable=invalid-name
+    predictions = jnp.argmax(model_output, axis=-1)
+    shapes.assert_same_shape(predictions, targets)
+    ones_and_zeros = jnp.equal(predictions, targets)
+    return jnp.sum(ones_and_zeros * weights) / jnp.sum(weights)
+
+  return base.Fn('WeightedCategoryAccuracy', f)
+
+
+def CategoryCrossEntropy():
+  """Returns a layer that computes cross entropy from activations and integers.
+
+  The layer takes two inputs:
+
+    - A batch of activation vectors. The components in a given vector should
+      be pre-softmax activations (mappable to a probability distribution via
+      softmax). For performance reasons, the softmax and cross entropy
+      computations are combined inside the layer.
+
+    - A batch of target categories; each target is an integer in
+      `{0, ..., N-1}`, where `N` is the activation vector depth/dimensionality.
+
+  To compute cross-entropy, the layer derives probability distributions from
+  its inputs:
+
+    - activation vectors: vector --> SoftMax(vector)
+
+    - target categories: integer --> OneHot(integer)
+
+  (The conversion of integer category targets to one-hot vectors amounts to
+  assigning all the probability mass to the target category.) Cross-entropy
+  per batch item is computed between the resulting distributions; notionally:
+
+      cross_entropy(one_hot(targets), softmax(model_output))
+
+  The layer returns the average of these cross-entropy values over all items in
+  the batch.
+  """
+  def f(model_output, targets):  # pylint: disable=invalid-name
+    cross_entropies = _category_cross_entropy(model_output, targets)
+    return jnp.average(cross_entropies)
+
+  return base.Fn('CategoryCrossEntropy', f)
+
+
+def WeightedCategoryCrossEntropy():
+  """Returns a layer like `CategoryCrossEntropy`, with weights as third input.
+
+  The layer takes three inputs:
+
+    - A batch of activation vectors. The components in a given vector should
+      be pre-softmax activations (mappable to a probability distribution via
+      softmax). For performance reasons, the softmax and cross entropy
+      computations are combined inside the layer.
+
+    - A batch of target categories; each target is an integer in
+      `{0, ..., N-1}`, where `N` is the activation vector depth/dimensionality.
+
+    - A batch of weights, which matches or can be broadcast to match the shape
+      of the target ndarray. This arg can give uneven weighting to different
+      items in the batch (depending, for instance, on the item's target
+      category).
+
+  To compute cross-entropy, the layer derives probability distributions from
+  its inputs:
+
+    - activation vectors: vector --> SoftMax(vector)
+
+    - target categories: integer --> OneHot(integer)
+
+  (The conversion of integer category targets to one-hot vectors amounts to
+  assigning all the probability mass to the target category.) Cross-entropy
+  per batch item is computed between the resulting distributions; notionally:
+
+      cross_entropy(one_hot(targets), softmax(model_output))
+
+  The layer returns the weighted average of these cross-entropy values over all
+  items in the batch.
+  """
+  def f(model_output, targets, weights):  # pylint: disable=invalid-name
+    cross_entropies = _category_cross_entropy(model_output, targets)
+    return jnp.sum(cross_entropies * weights) / jnp.sum(weights)
+
+  return base.Fn('WeightedCategoryCrossEntropy', f)
 
 
 def Accuracy(classifier=core.ArgMax()):
@@ -103,7 +239,7 @@ def L2Loss():
     shapes.assert_same_shape(targets, weights)
     weighted_sse = weights * (model_output - targets)**2
     return jnp.sum(weighted_sse) / jnp.sum(weights)
-  return Fn('L2Loss', f)
+  return base.Fn('L2Loss', f)
 
 
 def SmoothL1Loss():
@@ -135,14 +271,14 @@ def SmoothL1Loss():
     shapes.assert_same_shape(smooth_dist, weights)
     weighted_smooth_dist = weights * smooth_dist
     return jnp.sum(weighted_smooth_dist) / jnp.sum(weights)
-  return Fn('SmoothL1Loss', smoothl1loss)
+  return base.Fn('SmoothL1Loss', smoothl1loss)
 
 
 def WeightedSum():
   """Returns a layer that computes a weighted sum of the given values."""
   def f(values, weights):  # pylint: disable=invalid-name
     return jnp.sum(values * weights)
-  return Fn('WeightedSum', f)
+  return base.Fn('WeightedSum', f)
 
 
 def _Accuracy():
@@ -151,7 +287,7 @@ def _Accuracy():
     # TODO(pkozakowski): This assertion breaks some tests. Fix and uncomment.
     # shapes.assert_same_shape(predicted_category, target_category)
     return jnp.equal(predicted_category, target_category).astype(jnp.float32)
-  return Fn('_Accuracy', f)
+  return base.Fn('_Accuracy', f)
 
 
 def _CrossEntropy():
@@ -159,9 +295,9 @@ def _CrossEntropy():
   def f(model_output, target_category):  # pylint: disable=invalid-name
     # TODO(pkozakowski): This assertion breaks some tests. Fix and uncomment.
     # shapes.assert_shape_equals(target_category, model_output.shape[:-1])
-    target_distribution = one_hot(target_category, model_output.shape[-1])
+    target_distribution = core.one_hot(target_category, model_output.shape[-1])
     return -1.0 * jnp.sum(model_output * target_distribution, axis=-1)
-  return Fn('_CrossEntropy', f)
+  return base.Fn('_CrossEntropy', f)
 
 
 def _BinaryCrossEntropy():
@@ -173,7 +309,7 @@ def _BinaryCrossEntropy():
     j += jnp.dot(jnp.transpose(1 - target_category), jnp.log(1 - model_output))
     j = -1.0/batch_size * jnp.squeeze(j)
     return j
-  return Fn('_BinaryCrossEntropy', f)
+  return base.Fn('_BinaryCrossEntropy', f)
 
 
 def CrossEntropySum():
@@ -197,7 +333,7 @@ def _WeightedMean():
   """Returns a layer that computes a weighted mean of the given values."""
   def f(values, weights):  # pylint: disable=invalid-name
     return jnp.sum(values * weights) / jnp.sum(weights)
-  return Fn('_WeightedMean', f)
+  return base.Fn('_WeightedMean', f)
 
 
 def _WeightedSequenceMean():
@@ -213,11 +349,10 @@ def _WeightedSequenceMean():
     # Sequence is correct if not_correct_seq is 0, reverting here.
     correct_seq = 1.0 - jnp.minimum(1.0, not_correct_seq)
     return jnp.mean(correct_seq)  # Mean over batch.
-  return Fn('_WeightedSequenceMean', f)
+  return base.Fn('_WeightedSequenceMean', f)
 
 
-# TODO(jonni): Figure out the right name and home for this function.
-def one_hot(x, n_categories, dtype=jnp.float32):  # pylint: disable=invalid-name
-  """Makes a one-hot array (n+1 dims) from an int-categorical array (n dims)."""
-  indices_less_than_n = jnp.arange(n_categories)
-  return jnp.array(x[..., jnp.newaxis] == indices_less_than_n, dtype)
+def _category_cross_entropy(model_output, targets):  # pylint: disable=invalid-name
+  target_distributions = core.one_hot(targets, model_output.shape[-1])
+  model_log_distributions = core.log_softmax(model_output)
+  return - jnp.sum(target_distributions * model_log_distributions, axis=-1)

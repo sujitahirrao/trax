@@ -18,11 +18,105 @@
 
 from absl.testing import absltest
 import numpy as np
-
 import trax.layers as tl
 
 
 class MetricsTest(absltest.TestCase):
+
+  def test_category_accuracy(self):
+    layer = tl.CategoryAccuracy()
+    targets = np.array([0, 1, 2])
+
+    model_outputs = np.array([[.7, .2, .1, 0.],
+                              [.2, .7, .1, 0.],
+                              [.2, .1, .7, 0.]])
+    accuracy = layer([model_outputs, targets])
+    self.assertEqual(accuracy, 1.0)
+
+    model_outputs = np.array([[.2, .1, .7, 0.],
+                              [.2, .1, .7, 0.],
+                              [.2, .1, .7, 0.]])
+    accuracy = layer([model_outputs, targets])
+    self.assertEqual(accuracy, 1 / 3)
+
+  def test_weighted_category_accuracy_even_weights(self):
+    layer = tl.WeightedCategoryAccuracy()
+    weights = np.array([1., 1., 1.])
+    targets = np.array([0, 1, 2])
+
+    model_outputs = np.array([[.7, .2, .1, 0.],
+                              [.2, .7, .1, 0.],
+                              [.2, .1, .7, 0.]])
+    accuracy = layer([model_outputs, targets, weights])
+    self.assertEqual(accuracy, 1.0)
+
+    model_outputs = np.array([[.2, .1, .7, 0.],
+                              [.2, .1, .7, 0.],
+                              [.2, .1, .7, 0.]])
+    accuracy = layer([model_outputs, targets, weights])
+    self.assertEqual(accuracy, 1 / 3)
+
+  def test_weighted_category_accuracy_uneven_weights(self):
+    layer = tl.WeightedCategoryAccuracy()
+    weights = np.array([1., 5., 2.])
+    targets = np.array([0, 1, 2])
+
+    model_outputs = np.array([[.7, .2, .1, 0.],
+                              [.2, .7, .1, 0.],
+                              [.2, .1, .7, 0.]])
+    accuracy = layer([model_outputs, targets, weights])
+    self.assertEqual(accuracy, 1.0)
+
+    model_outputs = np.array([[.2, .7, .1, 0.],
+                              [.2, .7, .1, 0.],
+                              [.2, .7, .1, 0.]])
+    accuracy = layer([model_outputs, targets, weights])
+    self.assertEqual(accuracy, .625)
+
+  def test_category_cross_entropy(self):
+    layer = tl.CategoryCrossEntropy()
+    targets = np.array([0, 1])
+
+    # Near-perfect prediction (for both items in batch).
+    model_outputs = np.array([[9., 2., 0., -2.],
+                              [2., 9., 0., -2.]])
+    loss = layer([model_outputs, targets])
+    self.assertAlmostEqual(loss, .001, places=3)
+
+    # More right than wrong (for both items in batch).
+    model_outputs = np.array([[2.2, 2., 0., -2.],
+                              [2., 2.2, 0., -2.]])
+    loss = layer([model_outputs, targets])
+    self.assertAlmostEqual(loss, .665, places=3)
+
+    # First item near perfect, second item more right than wrong.
+    model_outputs = np.array([[9., 2., 0., -2.],
+                              [2., 2.2, 0., -2.]])
+    loss = layer([model_outputs, targets])
+    self.assertAlmostEqual(loss, .333, places=3)
+
+  def test_weighted_category_cross_entropy(self):
+    layer = tl.WeightedCategoryCrossEntropy()
+    targets = np.array([0, 1])
+    weights = np.array([30, 10])
+
+    # Near-perfect prediction (for both items in batch).
+    model_outputs = np.array([[9., 2., 0., -2.],
+                              [2., 9., 0., -2.]])
+    loss = layer([model_outputs, targets, weights])
+    self.assertAlmostEqual(loss, .001, places=3)
+
+    # More right than wrong (for both items in batch).
+    model_outputs = np.array([[2.2, 2., 0., -2.],
+                              [2., 2.2, 0., -2.]])
+    loss = layer([model_outputs, targets, weights])
+    self.assertAlmostEqual(loss, .665, places=3)
+
+    # First item (with 75% weight) near perfect, second more right than wrong.
+    model_outputs = np.array([[9., 2., 0., -2.],
+                              [2., 2.2, 0., -2.]])
+    loss = layer([model_outputs, targets, weights])
+    self.assertAlmostEqual(loss, .167, places=3)
 
   def test_accuracy_even_weights(self):
     layer = tl.Accuracy()
