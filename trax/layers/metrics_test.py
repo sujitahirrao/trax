@@ -118,6 +118,56 @@ class MetricsTest(absltest.TestCase):
     loss = layer([model_outputs, targets, weights])
     self.assertAlmostEqual(loss, .167, places=3)
 
+  def test_masked_sequence_accuracy(self):
+    layer = tl.MaskedSequenceAccuracy()
+    targets = np.array([[0, 1, 0, 0],
+                        [1, 0, 1, 0]])
+    weights = np.array([[1., 1., 1., 0.],
+                        [1., 1., 1., 0.]])
+
+    # Model gets both sequences right; output in final position would give
+    # wrong category but is ignored.
+    model_outputs = np.array([[[.9, .1], [.2, .8], [.7, .3], [.35, .65]],
+                              [[.3, .7], [.8, .2], [.1, .9], [.35, .65]]])
+    accuracy = layer([model_outputs, targets, weights])
+    self.assertEqual(accuracy, 1.)
+
+    # Model gets the first element of the first sequence barely wrong.
+    model_outputs = np.array([[[.45, .55], [.2, .8], [.7, .3], [.6, .4]],
+                              [[.3, .7], [.8, .2], [.1, .9], [.6, .4]]])
+    accuracy = layer([model_outputs, targets, weights])
+    self.assertEqual(accuracy, .5)
+
+    # Model gets second-to-last element of each sequence barely wrong.
+    model_outputs = np.array([[[.9, .1], [.2, .8], [.48, .52], [.6, .4]],
+                              [[.3, .7], [.8, .2], [.51, .49], [.6, .4]]])
+    accuracy = layer([model_outputs, targets, weights])
+    self.assertEqual(accuracy, 0.)
+
+  def test_binary_cross_entropy(self):
+    layer = tl.BinaryCrossEntropy()
+    targets = np.array([1, 1, 0, 0, 0])
+
+    # Near-perfect prediction for all five items in batch.
+    model_outputs = np.array([9., 9., -9., -9., -9.])
+    metric_output = layer([model_outputs, targets])
+    self.assertAlmostEqual(metric_output, 0.000123, places=6)
+
+    # More right than wrong for all five items in batch.
+    model_outputs = np.array([1., 1., -1., -1., -1.])
+    metric_output = layer([model_outputs, targets])
+    self.assertAlmostEqual(metric_output, 0.313, places=3)
+
+    # Near-perfect for 2, more right than wrong for 3.
+    model_outputs = np.array([9., 1., -1., -1., -9.])
+    metric_output = layer([model_outputs, targets])
+    self.assertAlmostEqual(metric_output, 0.188, places=3)
+
+    # More wrong than right for all five.
+    model_outputs = np.array([-1., -1., 1., 1., 1.])
+    metric_output = layer([model_outputs, targets])
+    self.assertAlmostEqual(metric_output, 1.313, places=3)
+
   def test_accuracy_even_weights(self):
     layer = tl.Accuracy()
     weights = np.array([1., 1., 1.])

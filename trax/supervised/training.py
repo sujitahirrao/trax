@@ -103,6 +103,7 @@ class Loop:
       eval_tasks=None,
       output_dir=None,
       checkpoint_at=None,
+      permanent_checkpoint_at=None,
       eval_at=None,
       which_task=None,
       n_devices=None,
@@ -136,6 +137,10 @@ class Loop:
       checkpoint_at: Function (integer --> boolean) telling, for step n, whether
           that step should have its checkpoint saved. If None, the default is
           periodic checkpointing at `task.n_steps_per_checkpoint`.
+      permanent_checkpoint_at: Function (integer --> boolean) telling,
+          for step n, whether that step should have its checkpoint saved
+          permanently. If None, the default is periodic checkpointing at
+          `task.n_steps_per_permanent_checkpoint`.
       eval_at: Function (integer --> boolean) that says, for training step n,
           whether that step should run evals. If None, run when checkpointing.
       which_task: Function (integer --> integer) indicating which task should be
@@ -179,6 +184,8 @@ class Loop:
       self._eval_model = model
 
     default_at = _at_step_1_and_every_nth_step(tasks[0].n_steps_per_checkpoint)
+    permanent_default_at = _at_step_1_and_every_nth_step(
+        tasks[0].n_steps_per_permanent_checkpoint)
     if output_dir is not None:
       self._output_dir = os.path.expanduser(output_dir)
       tf.io.gfile.makedirs(self._output_dir)
@@ -188,6 +195,8 @@ class Loop:
     # Prepare training components.
     self._step = 0
     self._checkpoint_at = checkpoint_at or default_at
+    self._permanent_checkpoint_at = (
+        permanent_checkpoint_at or permanent_default_at)
     if which_task is None:
       if len(tasks) > 1:
         raise ValueError('Must provide which_task for multitask training.')
@@ -201,9 +210,11 @@ class Loop:
     self._model.rng = self.new_rng()
     # In the memory-efficient case, we initialize in init_trainer.
     if not use_memory_efficient_trainer:
-      self._model.init(self._batch_signature)
+      if _is_uninitialized(self._model):
+        self._model.init(self._batch_signature)
       self._eval_model.rng = self.new_rng()
-      self._eval_model.init(self._batch_signature)
+      if _is_uninitialized(self._eval_model):
+        self._eval_model.init(self._batch_signature)
 
     # To handle the above case (i.e. random_seed = None), we psum the weights
     # and state and average them.
@@ -369,6 +380,8 @@ class Loop:
 
         if self._checkpoint_at(self.step):
           self.save_checkpoint()
+        if self._permanent_checkpoint_at(self.step):
+          self.save_checkpoint(permanent=True)
         if self._eval_at(self.step):
           logging.info('cpu memory use (MB): %.2f',
                        process.memory_info().rss / float(1024*1024))
@@ -502,7 +515,7 @@ class Loop:
     if self.step == 1:
       self._log_n_weights()
     self._log_step('Ran %d train steps in %0.2f secs' % (n_steps, elapsed_time))
-    self._log_scalars(
+    self._log_summary(
         {loss_name: total_loss / float(n_steps)},
         summary_writer, 'metrics/', 'train')
     if self.step == 1:
@@ -514,7 +527,7 @@ class Loop:
     # Average optimizer_metrics over n_steps.
     optimizer_metrics = {k: v / n_steps for k, v in optimizer_metrics.items()}
     train_parameters.update(optimizer_metrics)
-    self._log_scalars(
+    self._log_summary(
         train_parameters, summary_writer, 'training/', 'train', stdout=False)
 
   def _save_gin(self, summary_writer):
@@ -599,32 +612,37 @@ class Loop:
           sums += metric_values
         averages = sums / n_batches
         all_metrics = dict(zip(eval_task.metric_names, averages))
-        self._log_scalars(all_metrics, summary_writer, 'metrics/', 'eval')
+        self._log_summary(all_metrics, summary_writer, 'metrics/', 'eval')
 
         summary_metrics = dict(recursively_look_for_printable_states(
             model_state))
-        self._log_scalars(summary_metrics, summary_writer, 'summary_', 'eval')
+        self._log_summary(summary_metrics, summary_writer, 'summary_', 'eval')
 
-  def _log_scalars(self, scalars, summary_writer, scalar_prefix, log_prefix,
+  def _log_summary(self, values, summary_writer, value_prefix, log_prefix,
                    stdout=True):
     """Logs and saves provided metrics.
 
     Args:
-      scalars: Dict from metric name to metric value.
+      values: Dict from metric name to metric value.
       summary_writer: Jaxboard summary writer.
-      scalar_prefix: String appended in front of summary_writer entries.
+      value_prefix: String appended in front of summary_writer entries.
       log_prefix: String appended in front of logs.
       stdout: Boolean saying if logs should be logged to stdout as well.
     """
     should_write_summaries = self.is_chief and summary_writer is not None
-    for name, value in scalars.items():
-      self._log_step(
-          '%s %s | % .8f' %
-          (log_prefix.ljust(5), name.rjust(self._rjust_len), value),
-          stdout=stdout)
-      if should_write_summaries:
-        full_name = scalar_prefix + name
-        summary_writer.scalar(full_name, value, self.step)
+    for name, value in values.items():
+      full_name = value_prefix + name
+      s = jnp.shape(value)
+      if not s:
+        self._log_step(
+            '%s %s | % .8f' %
+            (log_prefix.ljust(5), name.rjust(self._rjust_len), value),
+            stdout=stdout)
+        if should_write_summaries:
+          summary_writer.scalar(full_name, value, self.step)
+      else:
+        if should_write_summaries:
+          summary_writer.image(full_name, value, self.step)
     if should_write_summaries:
       summary_writer.flush()
 
@@ -632,7 +650,7 @@ class Loop:
     """Logs message, labeled with the current training step number."""
     _log('Step % 6d: %s' % (self.step, msg), stdout=stdout)
 
-  def save_checkpoint(self):
+  def save_checkpoint(self, permanent=False):
     """Saves checkpoint to disk for the current training step."""
     if not self.is_chief:
       _log('Did not save checkpoint as we are not chief.')
@@ -640,7 +658,11 @@ class Loop:
     if self._output_dir is None:
       _log('Did not save checkpoint as output_dir is None')
       return
-    ckpt_file = os.path.join(self._output_dir, 'model.pkl.gz')
+    if permanent:
+      filename = 'model_{}.pkl.gz'.format(self.step)
+    else:
+      filename = 'model.pkl.gz'
+    ckpt_file = os.path.join(self._output_dir, filename)
     _log('Saving checkpoint to %s.' % ckpt_file, stdout=False)
     weights = self._model.weights
     state = self._model.state
@@ -863,7 +885,8 @@ class TrainTask:
   """A supervised task (labeled data + feedback mechanism) for training."""
 
   def __init__(self, labeled_data, loss_layer, optimizer,
-               lr_schedule=None, n_steps_per_checkpoint=100):
+               lr_schedule=None, n_steps_per_checkpoint=100,
+               n_steps_per_permanent_checkpoint=None):
     r"""Configures a training task.
 
     Args:
@@ -876,6 +899,8 @@ class TrainTask:
           loss-function gradients.
       lr_schedule: Learning rate schedule, a function step -> learning_rate.
       n_steps_per_checkpoint: How many steps to run between checkpoints.
+      n_steps_per_permanent_checkpoint: How many steps to run between permanent
+          checkpoints.
     """
     self._labeled_data = labeled_data
     self._loss_layer = loss_layer
@@ -883,6 +908,7 @@ class TrainTask:
     self._lr_schedule = lr_schedule
     self._sample_batch = next(labeled_data)
     self._n_steps_per_checkpoint = n_steps_per_checkpoint
+    self._n_steps_per_permanent_checkpoint = n_steps_per_permanent_checkpoint
 
   @property
   def labeled_data(self):
@@ -903,6 +929,10 @@ class TrainTask:
   @property
   def n_steps_per_checkpoint(self):
     return self._n_steps_per_checkpoint
+
+  @property
+  def n_steps_per_permanent_checkpoint(self):
+    return self._n_steps_per_permanent_checkpoint
 
   @property
   def optimizer(self):
@@ -995,6 +1025,9 @@ def _never(*args):
 
 def _at_step_1_and_every_nth_step(period):
   """A function that's true at 1 and n when n % period == 0."""
+  if period is None:
+    return lambda step_n: False
+
   def _at_1_and_periodically(step_n):
     return (step_n == 1) or (step_n > 0 and (step_n % period == 0))
   return _at_1_and_periodically
@@ -1112,3 +1145,15 @@ def _make_weights_and_state_same_across_hosts(weights_and_state):
       lambda ws: (ws / n_devices_total).astype(ws.dtype), weights_and_state)
 
   return weights_and_state
+
+
+def _is_uninitialized(model):
+  """Checks whether no weights in the model have been initialized."""
+  def _is_empty(x):
+    if isinstance(x, (list, tuple)):
+      return all(_is_empty(y) for y in x)
+    else:
+      return x is None
+  if not _is_empty(model.weights):
+    return False
+  return all(_is_uninitialized(l) for l in model.sublayers)

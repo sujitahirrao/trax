@@ -63,8 +63,8 @@ OptState = collections.namedtuple('_OptState', [
 
 _DEFAULT_METRICS = {
     'loss': tl.WeightedCategoryCrossEntropy(),
-    'accuracy': tl.Accuracy(),
-    'sequence_accuracy': tl.SequenceAccuracy(),
+    'accuracy': tl.WeightedCategoryAccuracy(),
+    'sequence_accuracy': tl.MaskedSequenceAccuracy(),
     'neg_log_perplexity': tl.Serial(tl.WeightedCategoryCrossEntropy(),
                                     tl.Negate()),
     'weights_per_batch_per_core': tl.Serial(tl.Drop(), tl.Drop(), tl.Sum()),
@@ -82,7 +82,9 @@ class Trainer:
                output_dir=None, random_seed=None, n_devices=None,
                checkpoints_at=None, should_save_checkpoints=True,
                should_write_summaries=True,
-               metrics=None, checkpoint_highest=None, checkpoint_lowest=None):
+               metrics=None, checkpoint_highest=None,
+               checkpoint_lowest=None,
+               init_checkpoint=None):
 
     self._is_chief, _, self._n_devices, rng = (
         training.init_host_and_devices(n_devices, random_seed))
@@ -105,6 +107,10 @@ class Trainer:
     # Setup the model.
     model_train = model(mode='train')
     model_predict_eval = model(mode='eval')
+    # Should work for fine-tuning of T5.
+    if init_checkpoint:
+      model_train.init_from_file(init_checkpoint, weights_only=True)
+      model_predict_eval.init_from_file(init_checkpoint, weights_only=True)
     self._model_with_loss = tl.Serial(model_train, loss_fn)
 
     # Setup state.
@@ -512,8 +518,10 @@ def train(output_dir,
           trainer_class=Trainer,
           steps=1000,
           checkpoints_at=None,
+          permanent_checkpoints_at=None,
           eval_steps=10,
           eval_frequency=100,
+          permanent_checkpoint_frequency=None,
           random_seed=None,
           save_graphs=True,
           metrics=None,
@@ -521,7 +529,8 @@ def train(output_dir,
           checkpoint_lowest=None,
           use_loop=True,
           loss_chunk_size=0,
-          use_memory_efficient_trainer=False):
+          use_memory_efficient_trainer=False,
+          init_checkpoint=None):
   """Train the model on the inputs.
 
   Args:
@@ -538,9 +547,13 @@ def train(output_dir,
     steps: int, total number of training steps.
     checkpoints_at: list of integers. Save a checkpoint for each training step
       in the list.
+    permanent_checkpoints_at: list of integers. Save a permanent checkpoint for
+      each training step in the list.
     eval_steps: int, num of steps per evaluation. If None or 0, eval disabled.
     eval_frequency: int, how often to run evaluation (every eval_frequency
       steps). If None or 0, eval disabled.
+    permanent_checkpoint_frequency: int, how often to save permanent checkpoints
+      (every permanent_checkpoint_frequency steps).
     random_seed: the random seed to use; time/os dependent if None (default).
     save_graphs: bool, if True, save computation graph to file.
     metrics: optionally override the default metrics dictionary.
@@ -548,11 +561,16 @@ def train(output_dir,
     checkpoint_lowest: save the checkpoint lowest at this metric.
     use_loop: whether to use training.Loop instead of Trainer.
     loss_chunk_size: int, if > 0 chunk loss into these sizes to save memory.
-    use_memory_efficient_trainer: whether to use memory-efficient trainer.
+    use_memory_efficient_trainer: whether to use memory-efficient trainer..
+    init_checkpoint: a checkpoint for fine tuning.
 
   Returns:
     trax.TrainerState or training.Loop if use_loop is True
   """
+  if (permanent_checkpoint_frequency is not None
+      and permanent_checkpoints_at is not None):
+    raise ValueError('Only one of ["permanent_checkpoint_frequency", '
+                     '"permanent_checkpoints_at"] should be set.')
   if use_loop:
     n_devices = num_devices() or fastmath.device_count()
 
@@ -561,11 +579,13 @@ def train(output_dir,
     if callable(inputs):  # If we pass a function, e.g., through gin, call it.
       inputs = inputs()
     opt = optimizer if use_memory_efficient_trainer else optimizer()
-    train_task = training.TrainTask(inputs.train_stream(n_devices),
-                                    loss_layer=loss_fn,
-                                    optimizer=opt,
-                                    lr_schedule=lr_schedule_fn(),
-                                    n_steps_per_checkpoint=eval_frequency)
+    train_task = training.TrainTask(
+        inputs.train_stream(n_devices),
+        loss_layer=loss_fn,
+        optimizer=opt,
+        lr_schedule=lr_schedule_fn(),
+        n_steps_per_checkpoint=eval_frequency,
+        n_steps_per_permanent_checkpoint=permanent_checkpoint_frequency)
 
     # Prepare the evaluation.
     metrics_dict = metrics if metrics is not None else _DEFAULT_METRICS
@@ -579,13 +599,24 @@ def train(output_dir,
     checkpoint_at = None
     if checkpoints_at is not None:
       checkpoint_at = lambda step: step in checkpoints_at
+    permanent_checkpoint_at = None
+    if permanent_checkpoints_at is not None:
+      permanent_checkpoint_at = (lambda step: step in permanent_checkpoints_at)
+
+    # Setup the model.
+    model_train = model(mode='train')
+    model_predict_eval = model(mode='eval')
+    if init_checkpoint:
+      model_train.init_from_file(init_checkpoint, weights_only=True)
+      model_predict_eval.init_from_file(init_checkpoint, weights_only=True)
     loop = training.Loop(
-        model(mode='train'),
+        model_train,
         [train_task],
-        eval_model=model(mode='eval'),
+        eval_model=model_predict_eval,
         eval_tasks=[eval_task],
         output_dir=output_dir,
         checkpoint_at=checkpoint_at,
+        permanent_checkpoint_at=permanent_checkpoint_at,
         n_devices=n_devices,
         loss_chunk_size=loss_chunk_size,
         use_memory_efficient_trainer=use_memory_efficient_trainer,
@@ -608,7 +639,8 @@ def train(output_dir,
                           checkpoints_at=checkpoints_at,
                           metrics=metrics,
                           checkpoint_lowest=checkpoint_lowest,
-                          checkpoint_highest=checkpoint_highest)
+                          checkpoint_highest=checkpoint_highest,
+                          init_checkpoint=init_checkpoint)
 
   epoch_steps = [steps]  # Only training if eval_frequency is 0 or None
   if eval_frequency and eval_steps > 0:

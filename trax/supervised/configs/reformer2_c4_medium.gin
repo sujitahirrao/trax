@@ -20,9 +20,21 @@ import trax.supervised.trainer_lib
 
 include 'c4.gin'
 
-# Corresponds roughly to T5 'large' ~ 770m params, i.e. T5's `bi_v1_large.gin`.
+ff_chunk_size = 512  # Decreasing can increase possible batch_size.
+
+enc_attn_type = @Attention
+
+MultiplicativeModularCausalAttention.sparsity = 16
+MultiplicativeConvCausalAttention.sparsity = 16
+MultiplicativeConvCausalAttention.length_kernel_size = 3
+
+dec_attn_type = @MultiplicativeConvCausalAttention
+
+ff_sparsity = 64
+loss_sparsity = 4
+
 d_model = 1024
-d_ff = 4096
+d_ff = 6144
 n_heads = 16
 n_layers = 24
 attn_kv = 64
@@ -33,7 +45,7 @@ vocab_size = 32000
 # ==============================================================================
 batcher.data_streams = @tf_inputs.data_streams
 batcher.bucket_length = 512
-batcher.batch_size_per_device = 4  # Reformer/2 can go upto 24
+batcher.batch_size_per_device = 8
 batcher.eval_batch_size = 64
 batcher.max_eval_length = %max_length
 batcher.buckets_include_inputs_in_length=True
@@ -47,7 +59,8 @@ multifactor.warmup_steps = 10000
 
 # Parameters for Adafactor:
 # ==============================================================================
-Adafactor.weight_decay_rate = 0.0
+Adafactor.weight_decay_rate = 1e-5
+Adafactor.weight_decay_n_steps = 100000
 Adafactor.beta1 = 0.0
 Adafactor.decay_rate = 0.8
 Adafactor.clipping_threshold = 1.0
@@ -60,48 +73,16 @@ Adafactor.multiply_by_parameter_scale = True
 # ==============================================================================
 train.eval_frequency = 1000
 train.eval_steps = 10
-train.model = @trax.models.Transformer
+train.model = @trax.models.Reformer2
 train.steps = 524288
 train.optimizer = @trax.optimizers.Adafactor
 train.checkpoint_highest = 'accuracy'
 train.checkpoint_lowest = 'loss'
-
-# Parameters for Transformer:
-# ==============================================================================
-Transformer.d_model = %d_model
-Transformer.d_ff = %d_ff
-Transformer.dropout = %dropout
-Transformer.max_len = %max_length
-Transformer.mode = 'train'
-Transformer.n_heads = %n_heads
-Transformer.n_encoder_layers = %n_layers
-Transformer.n_decoder_layers = %n_layers
-Transformer.input_vocab_size = %vocab_size
-
-# Parameters for Transformer2:
-# ==============================================================================
-Transformer2.d_model = %d_model
-Transformer2.d_ff = %d_ff
-Transformer2.dropout = %dropout
-Transformer2.max_len = %max_length
-Transformer2.mode = 'train'
-Transformer2.n_heads = %n_heads
-Transformer2.n_encoder_layers = %n_layers
-Transformer2.n_decoder_layers = %n_layers
-Transformer2.input_vocab_size = %vocab_size
-
-# Parameters for ConfigurableTransformer:
-# ==============================================================================
-ConfigurableTransformer.d_model = %d_model
-ConfigurableTransformer.d_ff = %d_ff
-ConfigurableTransformer.dropout = %dropout
-ConfigurableTransformer.ff_dropout = %dropout
-ConfigurableTransformer.max_len = %max_length
-ConfigurableTransformer.mode = 'train'
-ConfigurableTransformer.n_heads = %n_heads
-ConfigurableTransformer.n_encoder_layers = %n_layers
-ConfigurableTransformer.n_decoder_layers = %n_layers
-ConfigurableTransformer.input_vocab_size = %vocab_size
+train.permanent_checkpoint_frequency = 50000
+train.use_memory_efficient_trainer = False
+# train.loss_chunk_size = 512  # only applicable for memory efficient trainer
+# CrossEntropyLossWithLogSoftmax is required for memory efficient trainer.
+# train.loss_fn = @CrossEntropyLossWithLogSoftmax()
 
 # Parameters for SelfAttention:
 # ==============================================================================
@@ -124,18 +105,14 @@ ref2_encoder/LSHSelfAttention.n_chunks_after = 1
 
 # Parameters for Reformer2:
 # ==============================================================================
-ff_chunk_size = 0
-# enc_attn_type = @LSHSelfAttention
-# dec_attn_type = @ref2_encoder/LSHSelfAttention
-enc_attn_type = @Attention
-dec_attn_type = @CausalAttention
 Reformer2.d_model = %d_model  # was  512
 Reformer2.d_ff = %d_ff        # was 2048
 Reformer2.dropout = %dropout  # was  0.1
 Reformer2.ff_activation = @trax.layers.Relu
 Reformer2.ff_dropout = 0.1
 Reformer2.ff_chunk_size = %ff_chunk_size
-Reformer2.ff_sparsity = 0
+Reformer2.ff_sparsity = %ff_sparsity
+Reformer2.ff_use_sru = (1, 32)
 Reformer2.max_len = %max_length
 Reformer2.mode = 'train'
 Reformer2.n_heads = %n_heads
@@ -146,5 +123,8 @@ Reformer2.d_attention_key = %attn_kv    # d_model // n_heads
 Reformer2.d_attention_value = %attn_kv  # d_model // n_heads
 Reformer2.encoder_attention_type = %enc_attn_type
 Reformer2.encoder_decoder_attention_type = %dec_attn_type
+Reformer2.loss_sparsity = %loss_sparsity
 Reformer2.n_layers_forget = 0
 Reformer2.axial_pos_shape = None
+Reformer2.attention_chunk_size = 4
+Reformer2.use_bfloat16 = True
