@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2020 The Trax Authors.
+# Copyright 2021 The Trax Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 """Data imports in Trax."""
 import gin
 
+from trax.data import debug_data_pipeline
 from trax.data import inputs
 from trax.data import tf_inputs
 
@@ -46,6 +47,7 @@ shuffle = inputs.shuffle
 TFDS = data_configure(tf_inputs.TFDS)
 BertNextSentencePredictionInputs = data_configure(
     tf_inputs.BertNextSentencePredictionInputs)
+CastTo = data_configure(inputs.CastTo)
 CorpusToRandomChunks = data_configure(tf_inputs.CorpusToRandomChunks)
 CreateBertInputs = data_configure(tf_inputs.CreateBertInputs)
 mask_random_tokens = data_configure(tf_inputs.mask_random_tokens)
@@ -55,3 +57,5 @@ ConvertToUnicode = data_configure(tf_inputs.ConvertToUnicode)
 tokenize = tf_inputs.tokenize
 detokenize = tf_inputs.detokenize
 vocab_size = tf_inputs.vocab_size
+debug_pipeline = debug_data_pipeline.debug_pipeline
+CreateMathQAInputs = data_configure(tf_inputs.CreateMathQAInputs)

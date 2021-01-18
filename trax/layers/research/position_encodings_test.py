@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2020 The Trax Authors.
+# Copyright 2021 The Trax Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -79,6 +79,22 @@ class PositionEncodingsTest(unittest.TestCase):
     output_ntc2 = encoding_pred(input_ntc[:, 2:3, :])
     if not is_random:
       np.testing.assert_allclose(output_ntc2, output_ntc[:, 2:3, :], atol=1e-4)
+
+
+class SinCosEncodingsTest(unittest.TestCase):
+  """Position encodings conform to the position encodings protocol."""
+
+  @parameterized.parameterized.expand([
+      (1, 100, 8),  # typical
+      (1, 1, 8),  # short
+      (2, 100, 8),  # batched
+  ])
+  def test_training(self, n, t, c):
+    encoding = pe.SinCosPositionalEncoding()
+    input_ntc = np.random.randn(n, t, c)
+    encoding.init(input_ntc)
+    output_ntc = encoding(input_ntc)
+    self.assertEqual(output_ntc.shape, input_ntc.shape)
 
 
 if __name__ == '__main__':

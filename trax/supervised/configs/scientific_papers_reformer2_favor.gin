@@ -31,7 +31,6 @@ d_axial_pos_embs = (512, 512)
 d_ff = 4096
 n_heads = 8
 ff_chunk_size = 0
-attn_type = @LSHSelfAttention
 
 # Parameters for TFDS data pipeline:
 # ==============================================================================
@@ -43,7 +42,8 @@ make_inputs.train_stream = [
   @data.FilterEmptyExamples(),
   @data.TruncateToLength(),
   @data.AppendValue(),
-  @data.ConcatenateToLMInput(),
+  @data.PadToLength(),
+  @data.AddLossWeights(),
   @data.Batch(),
 ]
 train/data.TFDS.dataset_name = 'scientific_papers/arxiv:1.1.1'
@@ -55,8 +55,10 @@ data.Tokenize.keys = [0, 1]
 data.Tokenize.vocab_type = 'sentencepiece'
 data.TruncateToLength.len_map = {0: (15359, ), 1: (1023, )}
 data.AppendValue.val = {0:[0], 1:[1]}
-data.ConcatenateToLMInput.pad_to_length = 16384
+data.PadToLength.len_map = {0: 15360, 1: 1024}
+data.PadToLength.pad_value = {0: 0, 1: 0}
 data.Batch.batch_size = 8
+data.AddLossWeights.id_to_mask = 0
 
 make_inputs.eval_stream = [
   @eval/data.TFDS(),
@@ -65,26 +67,24 @@ make_inputs.eval_stream = [
   @data.FilterEmptyExamples(),
   @data.TruncateToLength(),
   @data.AppendValue(),
-  @data.ConcatenateToLMInput(),
+  @data.PadToLength(),
+  @data.AddLossWeights(),
   @data.Batch(),
 ]
 eval/data.TFDS.dataset_name = 'scientific_papers/arxiv:1.1.1'
 eval/data.TFDS.keys = ('article', 'abstract')
 eval/data.TFDS.train = False
 
-# Parameters for LSHSelfAttention:
+
+# Parameters for batcher:
 # ==============================================================================
-LSHSelfAttention.attention_dropout = 0.2
-LSHSelfAttention.chunk_len = 128
-LSHSelfAttention.n_buckets = 128
-LSHSelfAttention.n_chunks_after = 0
-LSHSelfAttention.n_chunks_before = 1
-LSHSelfAttention.n_hashes = 2
-LSHSelfAttention.n_parallel_heads = 1
-LSHSelfAttention.predict_drop_len = %max_len
-LSHSelfAttention.predict_mem_len = %max_len
-# Reformer2's *encoder* is bidirectional.
-ref2_encoder/LSHSelfAttention.n_chunks_after = 1
+batcher.data_streams = @tf_inputs.data_streams
+batcher.max_eval_length = %max_len
+# batcher.buckets = ([16384], [8, 1])   # 2x2s
+batcher.buckets = ([16384], [32, 1])  # 4x4s
+batcher.strict_pad_on_len = False
+batcher.id_to_mask = 0
+
 
 # Parameters for multifactor:
 # ==============================================================================
@@ -96,10 +96,9 @@ multifactor.warmup_steps = 10000
 # Parameters for Adafactor:
 # ==============================================================================
 Adafactor.beta1 = 0.0
-Adafactor.decay_rate = 0.95  # Used to be 0.8
+Adafactor.decay_rate = 0.9  # Used to be 0.8
 Adafactor.clipping_threshold = 1.0
-#Adafactor.epsilon1 = 1e-16
-Adafactor.epsilon1 = 1e-25
+Adafactor.epsilon1 = 1e-16
 Adafactor.epsilon2 = 0.001
 Adafactor.factored = True
 Adafactor.multiply_by_parameter_scale = True
@@ -109,31 +108,37 @@ Adafactor.multiply_by_parameter_scale = True
 # ==============================================================================
 train.eval_frequency = 500
 train.eval_steps = 10
-train.model = @trax.models.ReformerLM
+train.model = @trax.models.Reformer2
 train.steps = 1000000
 train.optimizer = @trax.optimizers.Adafactor
 train.checkpoint_highest = 'neg_log_perplexity'
 train.checkpoint_lowest = 'loss'
-# train.use_memory_efficient_trainer = True
+train.use_memory_efficient_trainer = True
 train.inputs = @trax.data.inputs.make_inputs
 
 
 # We are using T5's 32k SPM model by default.
 vocab_size = 32000
 
-# Parameters for ReformerLM:
+
+# Parameters for Reformer2:
 # ==============================================================================
-ReformerLM.attention_type = %attn_type
-ReformerLM.d_attention_key = %attn_kv
-ReformerLM.d_attention_value = %attn_kv
-ReformerLM.d_model = %d_model
-ReformerLM.d_ff = %d_ff
-ReformerLM.dropout = %dropout
-ReformerLM.ff_activation = @Relu
-ReformerLM.max_len = %max_len
-ReformerLM.mode = 'train'
-ReformerLM.n_heads = %n_heads
-ReformerLM.n_layers = %n_layers
-ReformerLM.vocab_size = %vocab_size
-ReformerLM.axial_pos_shape = 'fixed-base'
-ReformerLM.d_axial_pos_embs= %d_axial_pos_embs
+Reformer2.d_model = %d_model  # was  512
+Reformer2.d_ff = %d_ff        # was 2048
+Reformer2.dropout = %dropout  # was  0.1
+Reformer2.ff_activation = @trax.layers.Relu
+Reformer2.ff_dropout = 0.1
+Reformer2.ff_chunk_size = %ff_chunk_size
+Reformer2.max_len = %max_len
+Reformer2.mode = 'train'
+Reformer2.n_heads = %n_heads
+Reformer2.n_encoder_layers = %n_layers
+Reformer2.n_decoder_layers = %n_layers
+Reformer2.input_vocab_size = %vocab_size
+Reformer2.d_attention_key = %attn_kv    # d_model // n_heads
+Reformer2.d_attention_value = %attn_kv  # d_model // n_heads
+Reformer2.encoder_attention_type = @Favor
+Reformer2.encoder_decoder_attention_type = @CausalFavor
+Reformer2.axial_pos_shape = 'fixed-base'
+Reformer2.d_axial_pos_embs = %d_axial_pos_embs
+

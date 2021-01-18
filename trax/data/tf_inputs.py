@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2020 The Trax Authors.
+# Copyright 2021 The Trax Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,20 +18,25 @@
 
 import collections
 import functools
+import itertools
+import json
+import math
 import os
 import random
+import re
 
 from absl import logging
-
 import gin
 import numpy as np
-
+import scipy
 import t5.data
 import tensorflow as tf  # pylint: disable=g-explicit-tensorflow-version-import
 import tensorflow_datasets as tfds
 import tensorflow_text as tf_text
 from trax import fastmath
+from trax.data import debug_data_pipeline
 from trax.data import text_encoder
+
 
 # How many examples from the stream to skip at random during training.
 # For now, we skip at most 100K examples for efficiency.
@@ -311,6 +316,7 @@ def _train_and_eval_dataset_v1(problem_name, data_dir, train_shuffle_files,
 
 
 # Tokenization.
+@debug_data_pipeline.debug_pipeline
 def tokenize(stream,
              keys=None,
              vocab_type='subword',
@@ -347,7 +353,8 @@ def tokenize(stream,
           new_example.append(np.array(vocab.encode(x)) + n_reserved_ids)
         else:
           new_example.append(x)
-      yield tuple(new_example)
+      output = tuple(new_example)
+      yield output
     elif isinstance(example, dict):
       new_example = {}
       for k in example:
@@ -357,7 +364,8 @@ def tokenize(stream,
           new_example[k] = example[k]
       yield new_example
     else:
-      yield np.array(vocab.encode(example)) + n_reserved_ids
+      output = np.array(vocab.encode(example)) + n_reserved_ids
+      yield output
 
 
 @gin.configurable()
@@ -426,7 +434,8 @@ def ConvertToUnicode(keys=None):  # pylint: disable=invalid-name
     Function converting chosen elements of an example to UTF-8.
   """
 
-  def _convert_to_unicode_str(stream, keys=None):
+  @debug_data_pipeline.debug_pipeline
+  def _convert_to_unicode_str(stream):
     for example in stream:
       if isinstance(example, (list, tuple)):
         new_example = []
@@ -435,7 +444,8 @@ def ConvertToUnicode(keys=None):  # pylint: disable=invalid-name
             new_example.append(_to_unicode(x))
           else:
             new_example.append(x)
-        yield tuple(new_example)
+        output = tuple(new_example)
+        yield output
       elif isinstance(example, dict):
         new_example = {}
         for k in example:
@@ -445,9 +455,10 @@ def ConvertToUnicode(keys=None):  # pylint: disable=invalid-name
             new_example[k] = example[k]
         yield new_example
       else:
-        yield _to_unicode(example)
+        output = _to_unicode(example)
+        yield output
 
-  return lambda g: _convert_to_unicode_str(g, keys)
+  return _convert_to_unicode_str
 
 
 def vocab_size(vocab_type='subword',
@@ -1373,3 +1384,337 @@ def CreateT5GlueInputs(  # pylint: disable=invalid-name
                fastmath.numpy.array([1] * len(target_values)))
 
   return t5_yield_examples
+
+
+def compute_single_result(op_name, num_args):
+  """An implementation of the most popular ops from the MathQA dataset."""
+  # See https://gitlab.cs.washington.edu/amini91/mathqa-categorization/
+  # and specfically line 142 and following in new_DataStructure.py
+  # for an implementation which covers more details.
+  if op_name == 'add':
+    return num_args[0] + num_args[1]
+  elif op_name == 'circle_arc':
+    return num_args[0] / 360 * math.pi * 2 * num_args[1]
+  elif op_name == 'circle_area':
+    return math.pi * num_args[0]**2
+  elif op_name == 'circle_sector_area':
+    return num_args[1] / 360 * math.pi * (num_args[0]**2)
+  elif op_name == 'circumface':
+    return 2 * math.pi * num_args[0]
+  elif op_name == 'choose':
+    return scipy.misc.comb(num_args[0], num_args[1])
+  elif op_name == 'cosine':
+    return math.cos(num_args[0])
+  elif op_name == 'cube_edge_by_volume':
+    return num_args[0]**(1 / 3)
+  elif op_name == 'combined_work':
+    return 1 / (
+        min(num_args[0], 1 / num_args[0]) + min(num_args[1], 1 / num_args[1]))
+  elif op_name == 'count_interval':
+    return num_args[0] - num_args[1] + 1
+  elif op_name == 'diagonal':
+    return math.sqrt(num_args[0]**2 + num_args[1]**2)
+  elif op_name == 'divide':
+    if num_args[1] != 0:
+      return num_args[0] / num_args[1]
+    else:
+      return 0
+  elif op_name == 'factorial':
+    return math.factorial(min(15, int(num_args[0])))
+  elif op_name == 'floor':
+    return math.floor(num_args[0])
+  elif op_name == 'find_work':
+    return 1 / (
+        max(
+            min(num_args[0], 1 / num_args[0]), min(
+                num_args[1], 1 / num_args[1])) - min(
+                    min(num_args[0], 1 / num_args[0]),
+                    min(num_args[1], 1 / num_args[1])))
+  elif op_name == 'from_percent':
+    return num_args[0] / 100
+  elif op_name == 'gain_percent':
+    return 100 + num_args[0]
+  elif op_name == 'gcd':
+    return scipy.gcd(int(num_args[0]), int(num_args[1]))
+  elif op_name == 'inverse':
+    if num_args[0] != 0:
+      return 1 / num_args[0]
+    else:
+      return 0
+  elif op_name == 'lcm':
+    return scipy.lcm(int(num_args[0]), int(num_args[1]))
+  elif op_name == 'log':
+    return math.log(max(1e-5, num_args[0]), 2)
+  elif op_name == 'loss_percent':
+    return 100 - num_args[0]
+  elif op_name == 'max':
+    return max(num_args[0], num_args[1])
+  elif op_name == 'multiply':
+    return num_args[0] * num_args[1]
+  elif op_name == 'negate_percent':
+    return 100 - num_args[0]
+  elif op_name == 'negate':
+    return -num_args[0]
+  elif op_name == 'original_price_before_loss':
+    return num_args[1] * 100 / (100 + 1e-5 - num_args[0])
+  elif op_name == 'original_price_before_gain':
+    return num_args[1] * 100 / (100 + num_args[0])
+  elif op_name == 'permutation':
+    n, m = min(num_args[0], num_args[1]), max(num_args[0], num_args[1])
+    return math.factorial(int(m)) / math.factorial(int(m - n))
+  elif op_name == 'power':
+    return num_args[0]**min(num_args[1], 5)
+  elif op_name == 'percent':
+    return num_args[0] / 100 * num_args[1]
+  elif op_name == 'price_after_gain' or op_name == 'p_after_gain':
+    return (1 + num_args[0] / 100) * num_args[1]
+  elif op_name == 'price_after_loss' or op_name == 'price_after_loss':
+    return (1 - num_args[0] / 100) * num_args[1]
+  elif op_name == 'quadrilateral_area':
+    return num_args[0] * (num_args[1] + num_args[2]) / 2
+  elif op_name == 'reminder':
+    return num_args[0] % num_args[1]
+  elif op_name == 'rectangle_area':
+    return num_args[0] * num_args[1]
+  elif op_name == 'rectangle_perimeter':
+    return math.sqrt(num_args[0]**2 + num_args[1]**2)
+  elif op_name == 'rhombus_area':
+    return num_args[0] * num_args[1] / 2
+  elif op_name == 'sine':
+    return math.sin(num_args[0])
+  elif op_name == 'speed':
+    return num_args[0] / num_args[1]
+  elif op_name == 'sqrt':
+    return math.sqrt(max(0, num_args[0]))
+  elif op_name == 'subtract':
+    return num_args[0] - num_args[1]
+  elif op_name == 'square_edge_by_perimeter':
+    return num_args[0] / 4
+  elif op_name == 'square_edge_by_area':
+    return math.sqrt(num_args[0])
+  elif op_name == 'square_area':
+    return num_args[0]**2
+  elif op_name == 'surface_cube':
+    return 6 * num_args[0]**2
+  elif op_name == 'surface_rectangular_prism':
+    return 2 * (
+        num_args[0] * num_args[1] + num_args[0] * num_args[2] +
+        num_args[1] * num_args[2])
+  elif op_name == 'semi_circle_perimiter':
+    return math.pi * num_args[0] + 2 * num_args[0]
+  elif op_name == 'square_perimeter' or op_name == 'rhombus_perimeter':
+    return 4 * num_args[0]
+  elif op_name == 'surface_sphere':
+    return 4 * math.pi * num_args[0]**2
+  elif op_name == 'speed':
+    return num_args[0] / num_args[1]
+  elif op_name == 'speed_ratio_steel_to_stream':
+    return (num_args[0] + num_args[1]) / (num_args[0] - num_args[1])
+  elif op_name == 'speed_in_still_water':
+    return (num_args[0] + num_args[1]) / 2
+  elif op_name == 'stream_speed':
+    return (num_args[0] - num_args[1]) / 2
+  elif op_name == 'trapezium_area':
+    return num_args[0] * (num_args[1] + num_args[2]) / 2
+  elif op_name == 'triangle_area':
+    return num_args[0] * num_args[1] / 2
+  elif op_name == 'triangle_perimeter':
+    return num_args[0] + num_args[1] + num_args[2]
+  elif op_name == 'triangle_area_three_edges':
+    # Heron's formula
+    s = (num_args[0] + num_args[1] + num_args[2]) / 2
+    return math.sqrt(
+        max(0,
+            s * (s - num_args[0]) * (s - num_args[1]) * (s - num_args[2])))
+  elif op_name == 'union_prob':
+    return num_args[0] + num_args[1] - num_args[0]
+  elif op_name == 'negate_prob':
+    return 1 - num_args[0]
+  elif op_name == 'volume_cube':
+    return num_args[0]**3
+  elif op_name == 'volume_cone':
+    return math.pi * num_args[0]**2 * num_args[1] / 3
+  elif op_name == 'volume_cylinder':
+    return math.pi * num_args[0]**2 * num_args[1]
+  elif op_name == 'volume_rectangular_prism':
+    return num_args[0] * num_args[1] * num_args[2]
+  elif op_name == 'volume_sphere':
+    return 4 / 3 * math.pi * num_args[0]**3
+
+
+def compute_result(list_op, list_num):
+  """Python execution of MathQA ops."""
+  # The last of temporary results is the final answer.
+  temporary_results = []
+  for op in list_op:
+    op_name = op.split('(')[0]
+    start_bracket = op.find('(')
+    end_bracket = op.find(')')
+    op_args = op[start_bracket + 1:end_bracket].split(',')
+    num_args = []
+    for arg in op_args:
+      # The hash stands for a number stored in temporary_results.
+      # For example #2 refers to the third temporary result.
+      if arg[0] == '#':
+        temp_index = int(
+            re.findall(r'[-+]?[.]?[\d]+(?:,\d\d\d)*[\.]?\d*(?:[eE][-+]?\d+)?',
+                       arg)[0])
+        num_args.append(temporary_results[temp_index])
+      # The n prefix stands for numbers which listed in list_num -
+      # originally they were contained in the text.
+      elif arg[0] == 'n':
+        n_index = int(
+            re.findall(r'[-+]?[.]?[\d]+(?:,\d\d\d)*[\.]?\d*(?:[eE][-+]?\d+)?',
+                       arg)[0])
+        num_args.append(list_num[n_index])
+      elif arg[0] == 'c':
+        if arg == 'const_pi':
+          constant = math.pi
+        elif arg == 'const_deg_to_rad':
+          constant = math.pi / 180
+        else:
+          consts = re.findall(
+              r'[-+]?[.]?[\d]+(?:,\d\d\d)*[\.]?\d*(?:[eE][-+]?\d+)?', arg)
+          if len(consts) == 1:
+            constant = float(consts[0])
+          else:
+            constant1 = float(consts[0])
+            constant2 = float('0.' + consts[1])
+            constant = constant1 + constant2
+        num_args.append(constant)
+    temporary_results.append(compute_single_result(op_name, num_args))
+  return temporary_results
+
+
+def process_single_mathqa_example(example):
+  """Execute a single example and verify coherence of a MathQA problem.
+
+  Args:
+    example: a dictionary with the following fields: Problem - a natural
+      language formulation of the problem Rationale - a natural language
+      solution of the problem options - five possible answers ( a) b) c) d) and
+      e) ) correct - the letter representing the correct answer
+      annotated_formula - formula representing the full solution linear_formula
+      - a string of operations separated by the | character, e.g.
+      multiply(n2,const_100)|multiply(n0,n1)|divide(#0,#1)|
+      multiply(#2,const_100)|divide(#3,#1)| category - a natural language
+      description of the category to which a given problem belongs.
+
+  Returns:
+    answer_num: numerical answer contained in the example
+    python_result: numerical answers computed in Python, including intermediate
+      results. The answer_num should be close python_result[-1]
+    list_op: list of arithmetic operations
+    list_num: list of identified numbers in the text
+  """
+  question = example['Problem']
+  # The funny looking replace is needed to deal with numbers such as 4,000
+  # TODO(henrykm) deal with numbers written as words "one", "two", ...
+  list_num = [
+      float(num.replace(',', '')) for num in re.findall(
+          r'[-+]?[.]?[\d]+(?:,\d\d\d)*[\.]?\d*(?:[eE][-+]?\d+)?', question)
+  ]
+  list_op = example['linear_formula'].split('|')
+  answers = example['options']
+  correct_answer = example['correct']
+  index = answers.find('{} )'.format(correct_answer))
+  answer_string = re.findall(
+      r'[-+]?[.]?[\d]+(?:,\d\d\d)*[\.]?\d*(?:[eE][-+]?\d+)?', answers[index:])
+  # The if statement deals with empty lists - they are needed to treat
+  # a correct non-numerical answer e) None of the above. Here we do not want
+  # non-numerical answers, hence we return None.
+  if answer_string:
+    answer_num = float(
+        re.findall(r'[-+]?[.]?[\d]+(?:,\d\d\d)*[\.]?\d*(?:[eE][-+]?\d+)?',
+                   answers[index:])[0].replace(',', ''))
+  else:
+    return None
+  # The if statements below deals with answers written as fractions e.g.
+  # a ) 1 / 2 , b ) 1 / 3 , c ) 1 / 5 , d ) 10 / 30 , e ) 2 / 5 ?
+  index_end_of_answer = index + len(str(answer_num)) + 3
+  if index_end_of_answer < len(answers) and answers[index_end_of_answer] == '/':
+    answer_denom = float(
+        re.findall(r'[-+]?[.]?[\d]+(?:,\d\d\d)*[\.]?\d*(?:[eE][-+]?\d+)?',
+                   answers[index_end_of_answer:])[0].replace(',', ''))
+    answer_num /= answer_denom
+  # In some cases the list of operations contains a superflous last element,
+  # namely an empty string.
+  if not list_op[-1]:
+    list_op = list_op[:-1]
+  python_result = compute_result(list_op, list_num)
+  return answer_num, python_result, list_op, list_num
+
+
+def CreateMathQAInputs(  # pylint: disable=invalid-name
+    dataset_path=None,
+    train=True,
+    tolerance=0.01,
+    cumulative=True):
+  """Prepares MathQA inputs.
+
+  The generation procedure leaves a lot parameters to be set by the user.
+  Currently we support only correct examples in the following sense:
+  python execution agrees with the declared answer up to 1%.
+
+  According to this criterion wrong examples such as
+  problem: calculate 85184 ÷ ? = 352
+  operations ['multiply(n0,n1)']
+  are ignored (this should be divide(n0,n1) in this case).
+
+  Args:
+    dataset_path: a path with the MathQA dataset
+    train: if True, then generate training examples, otherwhise generate
+      validation examples (the dataset has also a test set)
+    tolerance: if for a given example relative difference between Python result
+      and the result declared in the dataset exceeds the level, then the example
+      is dropped; tolerances ranging from 0.1 to 0.001 yield from 18K to 21K
+      examples.
+    cumulative: if set to True, then generate examples in the format input -
+      problem + numbers + op1 + op2 + op3 target - op4 If set to False, then
+      examples are in the format input - problem + numbers target - all
+      operations
+
+  Returns:
+    mathqa_yield_examples: a generator of MathQA examples; the generator yields
+    non-tokenized examples - they can be further processed using for example
+    the tokenize function from this module
+
+    tokenize(mathqa_yield_examples, keys = [0, 1], vocab_file='en_32k.subword')
+  """
+  if train:
+    dataset_path = os.path.join(dataset_path, 'train.json')
+  else:
+    dataset_path = os.path.join(dataset_path, 'dev.json')
+  # Opening with GFile allows to use remotely stored files, e.g.
+  # in a gs bucket.
+  dataset_handle = tf.io.gfile.GFile(dataset_path, 'r')
+  dataset = json.load(dataset_handle)
+
+  def mathqa_yield_examples(generator=None):
+    del generator
+    while True:
+      for example in itertools.cycle(dataset):
+        result = process_single_mathqa_example(example)
+        # TODO(henrykm): Remove the first two ifs.
+        if not result:
+          continue
+        answer_num, python_result, list_op, list_num = result
+        if not answer_num or not python_result[-1]:
+          continue
+        if math.isclose(answer_num, python_result[-1], rel_tol=tolerance):
+          input_prefix = example['Problem'] + ' ' + ' '.join(
+              [str(num) for num in list_num])
+          if cumulative:
+            for op in list_op:
+              input_values = input_prefix
+              target_values = op
+              input_prefix += ' ' + op
+              yield input_values, target_values, np.array([1] *
+                                                          len(target_values))
+          else:
+            input_values = input_prefix
+            target_values = example['linear_formula']
+            yield input_values, target_values, np.array([1] *
+                                                        len(target_values))
+
+  return mathqa_yield_examples

@@ -1,4 +1,4 @@
-# Copyright 2020 The Trax Authors.
+# Copyright 2021 The Trax Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -113,7 +113,7 @@ Reformer2.ff_dropout = 0.1
 Reformer2.ff_chunk_size = %ff_chunk_size
 Reformer2.ff_sparsity = %ff_sparsity
 Reformer2.ff_use_sru = (1, 32)
-Reformer2.max_len = %max_length
+Reformer2.max_len = 32768  # 32*1024
 Reformer2.mode = 'train'
 Reformer2.n_heads = %n_heads
 Reformer2.n_encoder_layers = %n_layers
@@ -123,8 +123,10 @@ Reformer2.d_attention_key = %attn_kv    # d_model // n_heads
 Reformer2.d_attention_value = %attn_kv  # d_model // n_heads
 Reformer2.encoder_attention_type = %enc_attn_type
 Reformer2.encoder_decoder_attention_type = %dec_attn_type
+Reformer2.use_two_swaps_per_encoder_block = False
+Reformer2.reversible_encoder = True
 Reformer2.loss_sparsity = %loss_sparsity
 Reformer2.n_layers_forget = 0
-Reformer2.axial_pos_shape = 'fixed-base'
+Reformer2.axial_pos_shape = None
 Reformer2.attention_chunk_size = 0  # use 4 if it OOMs
-Reformer2.use_bfloat16 = True
+Reformer2.use_bfloat16 = False

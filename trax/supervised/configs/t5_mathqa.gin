@@ -23,14 +23,11 @@ import trax.layers.metrics
 
 include 'c4.gin'
 
-# This config illustrates how to manage two eval tasks.
-# See https://www.tensorflow.org/datasets/catalog/glue for a description
-# of the MNLI dataset.
+# See https://math-qa.github.io/ for more details about the MathQA dataset.
 
-dataset_name = 'glue/mnli'
-train_split = 'train'
-validation_split = 'validation_matched'
-validation_additional_split = 'validation_mismatched'
+# Under the dataset_path should be located train.json and dev.json
+# downloaded from the above site.
+dataset_path = 'path_to_the_dataset'
 
 # Corresponds roughly to T5 'large' ~ 770m params, i.e. T5's `bi_v1_large.gin`.
 d_model = 1024
@@ -53,42 +50,54 @@ MultiplicativeConvCausalAttention.length_kernel_size = 3
 
 dec_attn_type = @CausalAttention
 
+trax.data.Tokenize.keys = [0,1]
+trax.data.Tokenize.vocab_file = 'en_32k.subword'
+
 # Parameters for TFDS data pipeline:
 # ==============================================================================
 make_inputs.train_stream = [
-  @train/data.CreateT5GlueInputs(),
+  @train/data.CreateMathQAInputs(),
+  @data.Tokenize(),
   @data.Shuffle(),
   @data.PadToLength(),
   @data.TruncateToLength(),
   @data.Batch()
 ]
 make_inputs.eval_stream = [
-  @eval/data.CreateT5GlueInputs(),
+  @eval/data.CreateMathQAInputs(),
+  @data.Tokenize(),
   @data.Shuffle(),
   @data.PadToLength(),
   @data.TruncateToLength(),
   @data.Batch()
 ]
-
 make_additional_stream.stream = [
-  @eval_additional_task/data.CreateT5GlueInputs(),
+  @eval_additional_task/data.CreateMathQAInputs(),
+  @data.Tokenize(),
   @data.Shuffle(),
   @data.PadToLength(),
   @data.TruncateToLength(),
   @data.Batch()
 ]
 
-train/data.CreateT5GlueInputs.dataset_name = %dataset_name
-train/data.CreateT5GlueInputs.train = True
-eval/data.CreateT5GlueInputs.dataset_name = %dataset_name
-eval/data.CreateT5GlueInputs.train = False
+train/data.CreateMathQAInputs.dataset_path = %dataset_path
+train/data.CreateMathQAInputs.train = True
+train/data.CreateMathQAInputs.tolerance = 0.01
+train/data.CreateMathQAInputs.cumulative = True
 
-eval_additional_task/data.CreateT5GlueInputs.dataset_name = %dataset_name
-eval_additional_task/data.CreateT5GlueInputs.train = %validation_additional_split
+eval/data.CreateMathQAInputs.dataset_path = %dataset_path
+eval/data.CreateMathQAInputs.train = False
+eval/data.CreateMathQAInputs.tolerance = 0.01
+eval/data.CreateMathQAInputs.cumulative = True
+
+eval_additional_task/data.CreateMathQAInputs.dataset_path = %dataset_path
+eval_additional_task/data.CreateMathQAInputs.train = False
+eval_additional_task/data.CreateMathQAInputs.tolerance = 0.01
+eval_additional_task/data.CreateMathQAInputs.cumulative = False
 eval_additional_task/trax.supervised.training.EvalTask.labeled_data = @trax.data.inputs.make_additional_stream()
 # Explicitly pass the accuracy metric - we can pass multiple metrics if needs be
-eval_additional_task/trax.supervised.training.EvalTask.metrics = [@trax.layers.WeightedCategoryAccuracy(),]
-eval_additional_task/trax.supervised.training.EvalTask.metric_names = [%validation_additional_split,]
+eval_additional_task/trax.supervised.training.EvalTask.metrics = [@trax.layers.WeightedCategoryAccuracy(), @trax.layers.SequenceAccuracy()]
+eval_additional_task/trax.supervised.training.EvalTask.metric_names = ['Full program accuracy', 'Full program sequence accuracy']
 
 data.PadToLength.len_map = {0: 512, 1: 512, 2: 512}
 data.PadToLength.pad_value = {0: 0, 1: 0, 2:0}
@@ -125,35 +134,7 @@ ConfigurableTransformer.encoder_attention_type = %enc_attn_type
 ConfigurableTransformer.encoder_decoder_attention_type = %dec_attn_type
 ConfigurableTransformer.loss_sparsity = %loss_sparsity
 
-# Parameters for Transformer:
-# ==============================================================================
-Transformer.d_ff = %d_ff
-Transformer.d_model = %d_model
-Transformer.dropout = 0.1
-Transformer.dropout_shared_axes = None
-Transformer.input_vocab_size = 32000
-Transformer.max_len = 2048
-Transformer.n_decoder_layers = %n_layers
-Transformer.n_encoder_layers = %n_layers
-Transformer.n_heads = %n_heads
-Transformer.output_vocab_size = None
-
-# Parameters for Adafactor:
-# ==============================================================================
-Adafactor.weight_decay_rate = 1e-5
-Adafactor.weight_decay_n_steps = 100000
-Adafactor.beta1 = 0.0
-Adafactor.decay_rate = 0.8
-Adafactor.clipping_threshold = 1.0
-Adafactor.epsilon1 = 1e-16
-Adafactor.epsilon2 = 0.001
-Adafactor.factored = True
-Adafactor.multiply_by_parameter_scale = True
-
 # Parameters for multifactor:
 # ==============================================================================
 multifactor.constant = 1e-3
-# multifactor.factors = 'constant'
-Adam.weight_decay_rate = 0.0   # default is 1e-05
-multifactor.factors = 'constant * linear_warmup'
-multifactor.warmup_steps = 1000  # default is 400
+multifactor.factors = 'constant'
