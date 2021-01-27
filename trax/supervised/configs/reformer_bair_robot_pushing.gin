@@ -61,7 +61,7 @@ Adam.eps = 1e-9
 # ==============================================================================
 train.eval_frequency = 20
 train.eval_steps = 1
-train.inputs = @trax.data.tf_inputs.inputs
+train.inputs = @trax.data.inputs.make_inputs
 # train.model: see top
 train.optimizer = @trax.optimizers.Adam
 train.steps = 100000
@@ -86,5 +86,5 @@ ReformerLM.mode = 'train'
 ReformerLM.n_heads = 4
 ReformerLM.n_layers = %n_layers
 ReformerLM.vocab_size = 256
-ReformerLM.axial_pos_shape = (2, 64, 64, 3)
-ReformerLM.d_axial_pos_embs= (128, 128, 128, 128)
+ReformerLM.pos_axial_shape = (2, 64, 64, 3)
+ReformerLM.pos_d_axial_embs= (128, 128, 128, 128)

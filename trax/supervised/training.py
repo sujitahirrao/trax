@@ -200,9 +200,9 @@ class Loop:
     self._permanent_checkpoint_at = (
         permanent_checkpoint_at or permanent_default_at)
     if which_task is None:
-      if len(tasks) > 1:
-        raise ValueError('Must provide which_task for multitask training.')
-      which_task = lambda _: 0
+      # If which task is not passed, then we permute tasks one by one.
+      # If len(tasks) = 1, then which_task is a constant function equal to 0.
+      which_task = lambda n: n % len(tasks)
     self._which_task = which_task
 
     # Initialize using the given random seed.
@@ -858,19 +858,28 @@ class Loop:
     input_signature = d['input_signature']
     weights_and_state_sig = self._model.weights_and_state_signature(
         input_signature)
-    weights, state = tl.unflatten_weights_and_state(
-        d['flat_weights'], d['flat_state'], weights_and_state_sig)
-    self._model.state = state
+    try:
+      restored_state = True
+      weights, state = tl.unflatten_weights_and_state(
+          d['flat_weights'], d['flat_state'], weights_and_state_sig)
+      self._model.state = state
+    except IndexError:
+      _log('Failed restoring model state from checkpoint, trying weights only.')
+      restored_state = False
+      weights, _ = tl.unflatten_weights_and_state(
+          d['flat_weights'], d['flat_state'], weights_and_state_sig,
+          weights_only=True)
     self._model.weights = weights
     self._eval_model.weights = self._model.weights
     # Restore eval model state; note: it's not always the same as train state.
-    if 'flat_eval_state' in d:
-      flat_eval_state = d['flat_eval_state']
-    else:  # It wasn't saved in old checkpoints; remove this branch once ported.
-      flat_eval_state = d['flat_state']
-    _, eval_state = tl.unflatten_weights_and_state(
-        d['flat_weights'], flat_eval_state, weights_and_state_sig)
-    self._eval_model.state = eval_state
+    if restored_state:
+      if 'flat_eval_state' in d:
+        flat_eval_state = d['flat_eval_state']
+      else:  # It wasn't saved in old checkpoints; remove this branch once done.
+        flat_eval_state = d['flat_state']
+      _, eval_state = tl.unflatten_weights_and_state(
+          d['flat_weights'], flat_eval_state, weights_and_state_sig)
+      self._eval_model.state = eval_state
     _log('Checkpoint loaded from %s.' % path, stdout=False)
 
   @contextlib.contextmanager
@@ -939,6 +948,7 @@ def _model_with_metrics(model, eval_task):
   )
 
 
+@gin.configurable()
 class TrainTask:
   """A supervised task (labeled data + feedback mechanism) for training."""
 

@@ -16,6 +16,7 @@
 # Lint as: python3
 """Implementations of reversible layers."""
 
+from absl import logging
 import jax
 from trax import fastmath
 from trax.layers import base
@@ -115,6 +116,58 @@ class ReversibleSelect(ReversibleLayer):
 
 def ReversibleSwap():  # pylint: disable=invalid-name
   return ReversibleSelect([1, 0], name='ReversibleSwap')
+
+
+class ReversibleReshape(ReversibleLayer):
+  """Reversible reshaping layer."""
+
+  def __init__(self, shape1, shape2, n_in=1):
+    self._shape1 = list(shape1)
+    self._shape2 = list(shape2)
+    name = 'ReversibleReshape_%s_%s' % (str(shape1), str(shape2))
+    super().__init__(n_in=n_in, n_out=n_in, name=name)
+
+  def forward(self, inputs):
+    if not isinstance(inputs, (tuple, list)):
+      inputs = (inputs,)
+    res = []
+    for x in inputs:
+      new_shape = self._shape2 + list(x.shape)[len(self._shape1):]
+      res.append(fastmath.numpy.reshape(x, new_shape))
+    if len(res) == 1:
+      return res[0]
+    return tuple(res)
+
+  def reverse(self, outputs, weights=(), state=(), new_state=(), rng=None):
+    del state, new_state, rng, weights
+    if not isinstance(outputs, (tuple, list)):
+      outputs = (outputs,)
+    res = []
+    for x in outputs:
+      new_shape = self._shape1 + list(x.shape)[len(self._shape2):]
+      res.append(fastmath.numpy.reshape(x, new_shape))
+    if len(res) == 1:
+      return res[0]
+    return tuple(res)
+
+
+class ReversiblePrintShape(ReversibleLayer):
+  """Reversible PrintShape for debugging reversible serial layers."""
+
+  def __init__(self, n_in=1, msg=''):
+    super().__init__(n_in=n_in, n_out=n_in)
+    self._msg = msg
+
+  def forward(self, xs):
+    shapes_and_dtypes = ', '.join([str(x.shape) + f'[{x.dtype}]' for x in xs])
+    info = f'PrintShape: {self._msg}: [{shapes_and_dtypes}]'
+    print(info)
+    logging.info(info)
+    return xs
+
+  def reverse(self, outputs, weights=(), state=(), new_state=(), rng=None):
+    del state, new_state, rng, weights
+    return outputs
 
 
 class ReversibleSerial(ReversibleLayer, cb.Serial):
@@ -245,8 +298,25 @@ class ReversibleHalfResidual(ReversibleLayer):
     # Forward pass through self.compute_residual. Outputs that will not receive
     # a gradient signal from subsequent layers are moved to aux.
     def call_compute_residual(x, weights):
+      state_to_pass = state[0]  # old_state
+
+      # _replace_second_time is currently used exclusively in _RememberInReverse
+      # layer to combat numerical instability in Reformer2 when quantizing
+      # the mask in SparseFF.
+      def _replace_second_time(stt, nstt):
+        if (isinstance(stt, tuple) and len(stt) == 2 and
+            isinstance(stt[1], dict) and 'running_second_time' in stt[1]):
+          return (nstt[0], {'running_second_time_yes': ()})
+        elif isinstance(stt, (tuple, list)):
+          assert isinstance(nstt, (tuple, list)) and len(nstt) == len(stt)
+          return type(stt)([
+              _replace_second_time(s, ns) for s, ns in zip(stt, nstt)])
+        else:
+          return stt
+
+      state_to_pass = _replace_second_time(state_to_pass, new_state[0])
       res, _ = self.compute_residual.pure_fn(
-          x, weights=weights, state=state[0], rng=rngs[0])
+          x, weights=weights, state=state_to_pass, rng=rngs[0])
       if not isinstance(res, (tuple, list)):
         return res, None
       else:

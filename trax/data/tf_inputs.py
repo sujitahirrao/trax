@@ -1320,15 +1320,16 @@ def get_glue_t5_labels(dataset_name):
         'glue/sst2': ('negative', 'positive'),
         'glue/mrpc': ('not_equivalent', 'equivalent'),
         'glue/qqp': ('not_duplicate', 'duplicate'),
-        # Requires processing of floats
-        # 'glue/stsb': ('sentence1', 'sentence2'),
+        # Requires processing of floats, though one can still measure
+        # performance for the sequence accuracy task.
+        'glue/stsb': ('sentence1', 'sentence2'),
         'glue/mnli': ('entailment', 'neutral', 'contradiction'),
         'glue/qnli': ('entailment', 'not_entailment'),
         'glue/rte': ('entailment', 'not_entailment'),
         # Used for evaluation and for training of T5.
         # As explained in Section 2.4 of https://arxiv.org/pdf/1910.10683.pdf
         # it has an overlap with WSC from Super-GLUE.
-        # 'glue/wnli': ('sentence1', 'sentence2'),
+        'glue/wnli': ('sentence1', 'sentence2'),
     }
     return glue_t5_labels[ext_task_name]
   except KeyError:
@@ -1649,7 +1650,15 @@ def CreateMathQAInputs(  # pylint: disable=invalid-name
     dataset_path=None,
     train=True,
     tolerance=0.01,
-    cumulative=True):
+    cumulative=True,
+    partial_results=True,
+    nlp_rationale=False,
+    correct_answer=False,
+    correct_answer_given_reasoning=False,
+    category=False,
+    order_prediction=False,
+    reduced_operation_name=True,
+    qed=False):
   """Prepares MathQA inputs.
 
   The generation procedure leaves a lot parameters to be set by the user.
@@ -1662,9 +1671,9 @@ def CreateMathQAInputs(  # pylint: disable=invalid-name
   are ignored (this should be divide(n0,n1) in this case).
 
   Args:
-    dataset_path: a path with the MathQA dataset
+    dataset_path: a path with the MathQA dataset.
     train: if True, then generate training examples, otherwhise generate
-      validation examples (the dataset has also a test set)
+      validation examples (the dataset has also a test set).
     tolerance: if for a given example relative difference between Python result
       and the result declared in the dataset exceeds the level, then the example
       is dropped; tolerances ranging from 0.1 to 0.001 yield from 18K to 21K
@@ -1672,14 +1681,33 @@ def CreateMathQAInputs(  # pylint: disable=invalid-name
     cumulative: if set to True, then generate examples in the format input -
       problem + numbers + op1 + op2 + op3 target - op4 If set to False, then
       examples are in the format input - problem + numbers target - all
-      operations
+      operations.
+    partial_results: if set to True, then partial results will be reported as
+      part of the input, e.g. input - problem + numbers + op1 + #1 + op2 + #2 +
+      op3 + #3, target - op4, where #k is the partial results from operation
+      opk. Activated only in cumulative set to True.
+    nlp_rationale: if set to True, then input is the problem and the target is
+      the nlp rationale.
+    correct_answer: if set to True, then input is the problem plus all possible
+      answers and the target is the correct answer.
+    correct_answer_given_reasoning: if set to True, then input is the problem
+      plus linear formula plus all possible answers and the target is the
+      correct answer.
+    category: if set to True, then input is the problem and the target is its
+      category.
+    order_prediction: if set to True, then input is the problem and a list of
+      all operations; with probability 0.5 two operations are swapped; the task
+      consists in detecting whether the operations were swapped. See the
+      order prediction task in CreateAquaInputs in this file.
+    reduced_operation_name: If set to True, then in order prediction consider
+      only the operation token without parameterers.
+    qed: if set to True, then the reasoning is finished with an additional
+      operation qed.
 
   Returns:
     mathqa_yield_examples: a generator of MathQA examples; the generator yields
     non-tokenized examples - they can be further processed using for example
     the tokenize function from this module
-
-    tokenize(mathqa_yield_examples, keys = [0, 1], vocab_file='en_32k.subword')
   """
   if train:
     dataset_path = os.path.join(dataset_path, 'train.json')
@@ -1701,20 +1729,154 @@ def CreateMathQAInputs(  # pylint: disable=invalid-name
         answer_num, python_result, list_op, list_num = result
         if not answer_num or not python_result[-1]:
           continue
+        if qed:
+          list_op.append('qed')
         if math.isclose(answer_num, python_result[-1], rel_tol=tolerance):
-          input_prefix = example['Problem'] + ' ' + ' '.join(
-              [str(num) for num in list_num])
+          input_prefix = example['Problem']
+          for i in range(len(list_num)):
+            input_prefix += ' n{} = {}'.format(i, list_num[i])
           if cumulative:
-            for op in list_op:
+            for i in range(len(list_op)):
               input_values = input_prefix
-              target_values = op
-              input_prefix += ' ' + op
+              target_values = list_op[i]
+              input_prefix += ' ' + list_op[i]
+              if partial_results:
+                input_prefix += ' #{} = {}'.format(i, answer_num)
               yield input_values, target_values, np.array([1] *
                                                           len(target_values))
+          elif nlp_rationale:
+            input_values = 'infer full rationale: ' + input_prefix
+            target_values = example['Rationale']
+            yield input_values, target_values, np.array([1] *
+                                                        len(target_values))
+          elif correct_answer:
+            input_values = 'infer correct answer: ' + input_prefix
+            input_values += ' ' + example['options']
+            target_values = example['correct']
+            yield input_values, target_values, np.array([1] *
+                                                        len(target_values))
+          elif correct_answer_given_reasoning:
+            input_values = 'infer correct answer given reasoning: ' + input_prefix
+            input_values += ' ' + ' '.join(list_op) + ' ' + example['options']
+            target_values = example['correct']
+            yield input_values, target_values, np.array([1] *
+                                                        len(target_values))
+          elif category:
+            input_values = 'infer category: ' + input_prefix
+            target_values = example['category']
+            yield input_values, target_values, np.array([1] *
+                                                        len(target_values))
+          elif order_prediction:
+            if np.random.uniform() < 0.5 and len(list_op) >= 2:
+              idx = range(len(list_op))
+              i1, i2 = random.sample(idx, 2)
+              list_op[i1], list_op[i2] = list_op[i2], list_op[i1]
+              target_values = 'not_ordered'
+            else:
+              target_values = 'ordered'
+            if reduced_operation_name:
+              list_op = [op.split('(')[0] for op in list_op]
+            input_values = 'order prediction: ' + input_prefix + ' ' + ' '.join(
+                list_op)
+            yield input_values, target_values, np.array([1] *
+                                                        len(target_values))
           else:
-            input_values = input_prefix
+            input_values = 'infer full calculation: ' + input_prefix
             target_values = example['linear_formula']
             yield input_values, target_values, np.array([1] *
                                                         len(target_values))
 
   return mathqa_yield_examples
+
+
+def CreateAquaInputs(  # pylint: disable=invalid-name
+    dataset_path=None,
+    train=True,
+    cumulative=False,
+    rationale=False,
+    correct_answer=False,
+    correct_answer_given_reasoning=False,
+    order_prediction=False):
+  """Prepares Aqua inputs.
+
+  Args:
+    dataset_path: a path with the Aqua dataset.
+    train: if True, then generate training examples, otherwhise generate
+      validation examples (the dataset has also a test set).
+    cumulative: if set to True, then generate examples in the format input -
+      problem + step1 + step3 + step3 target - step4 If set to False, then
+      examples are in the format input - problem, target - all operations.
+    rationale: if set to True, then input is the problem and the target is the
+      rationale.
+    correct_answer: if set to True, then input is the problem plus all possible
+      answers and the target is the correct answer.
+    correct_answer_given_reasoning: if set to True, then input is the problem
+      plus reasoning (aka rationale) plus all possible answers and the target is
+      the correct answer.
+    order_prediction: if set to True, then input is the problem and a list of
+      all operations; with probability 0.5 two operations are swapped; the task
+      consists in detecting whether the operations were swapped. A similar
+      additional task was considered in https://arxiv.org/pdf/1909.11942.pdf and
+        in a recent work of Piotr Piękos, henrykm@ and mateuszm@.
+
+  Returns:
+    aqua_yield_examples: a generator of Aqua examples; the generator yields
+    non-tokenized examples - they can be further processed using for example
+    the tokenize function from this module
+  """
+  if train:
+    dataset_path = os.path.join(dataset_path, 'train.json')
+  else:
+    dataset_path = os.path.join(dataset_path, 'dev.json')
+  # Opening with GFile allows to use remotely stored files, e.g.
+  # in a gs bucket.
+  dataset_handle = tf.io.gfile.GFile(dataset_path, 'r')
+  dataset = []
+  for line in dataset_handle:
+    dataset.append(json.loads(line))
+
+  def aqua_yield_examples(generator=None):
+    del generator
+    while True:
+      for example in itertools.cycle(dataset):
+        input_prefix = example['question']
+        steps = example['rationale'].split('\n')
+        if cumulative:
+          for i in range(len(steps)):
+            input_values = 'infer cumulative rationale: ' + input_prefix
+            target_values = steps[i]
+            input_prefix += ' ' + steps[i]
+            yield input_values, target_values, np.array([1] *
+                                                        len(target_values))
+        elif rationale:
+          input_values = 'infer full rationale: ' + input_prefix
+          target_values = example['rationale']
+          yield input_values, target_values, np.array([1] * len(target_values))
+        elif correct_answer:
+          input_values = 'infer correct answer: ' + input_prefix
+          input_values += ' ' + ' '.join(example['options'])
+          target_values = example['correct']
+          yield input_values, target_values, np.array([1] * len(target_values))
+        elif correct_answer_given_reasoning:
+          input_values = 'infer correct answer given reasoning: ' + input_prefix
+          input_values += ' ' + example['rationale'] + ' ' + ' '.join(
+              example['options'])
+          target_values = example['correct']
+          yield input_values, target_values, np.array([1] * len(target_values))
+        elif order_prediction:
+          if np.random.uniform() < 0.5 and len(steps) >= 2:
+            idx = range(len(steps))
+            i1, i2 = random.sample(idx, 2)
+            steps[i1], steps[i2] = steps[i2], steps[i1]
+            target_values = 'not_ordered'
+          else:
+            target_values = 'ordered'
+          input_values = 'order prediction: ' + input_prefix + ' ' + '\n'.join(
+              steps)
+          yield input_values, target_values, np.array([1] * len(target_values))
+        else:
+          raise ValueError(
+              'One of the boolean parameters of the Aqua generator must be set to True.'
+          )
+
+  return aqua_yield_examples

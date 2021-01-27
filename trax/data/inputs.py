@@ -83,12 +83,24 @@ from trax.fastmath import numpy as jnp
 
 
 def Serial(*fns):  # pylint: disable=invalid-name
-  """Combines generator functions into one that runs them in turn."""
+  """Combines generator functions into one that runs them serially."""
   def composed_fns(generator=None):
     for f in fastmath.tree_flatten(fns):
       generator = f(generator)
     return generator
   return composed_fns
+
+
+def Parallel(*fns):  # pylint: disable=invalid-name
+  """Combines generator functions into one that runs them in parallel."""
+  def parallel_generator():
+    generators = []
+    for f in fastmath.tree_flatten(fns):
+      generators.append(f())
+    while True:
+      for generator in generators:
+        yield next(generator)
+  return parallel_generator
 
 
 def Log(n_steps_per_example=1, only_shapes=True):  # pylint: disable=invalid-name
@@ -770,6 +782,12 @@ def make_additional_stream(stream=gin.REQUIRED):
 
 
 @gin.configurable()
+def make_parallel_stream(streams=gin.REQUIRED):
+  """Create a parallel stream for use in gin configs for additional tasks."""
+  return Parallel(streams)()
+
+
+@gin.configurable()
 def batcher(data_streams=gin.REQUIRED, variable_shapes=True,
             batch_size_per_device=32, batch_size=None, eval_batch_size=32,
             bucket_length=32, buckets=None,
@@ -1037,6 +1055,10 @@ def addition_inputs(
       x = [i + 1 for i in inp]
       y = [i + 1 for i in tgt]
       weights = [1] * len(tgt)
+      candidate_example = (np.array(x), np.array(y), np.array(weights))
+      if any(len(sample) > max_length for sample in candidate_example):
+        # sample too long, try again
+        return single_example(max_length, min_length)
       return (np.array(x), np.array(y), np.array(weights))
     else:
       x = [base+2] + [i+1 for i in inp] + [base+2] + [i+1 for i in tgt]
@@ -1045,8 +1067,8 @@ def addition_inputs(
 
   def batches(max_length, min_length):
     """Batches of examples."""
-    if max_length < 3:
-      raise ValueError('Maximum length must be at least 3.')
+    if max_length < 3 or min_length < 3:
+      raise ValueError('Maximum/minimum length must be at least 3.')
     while True:
       ex = [single_example(max_length, min_length) for _ in range(batch_size)]
       padded_batch = [pad_to_max_dims(x, boundary=pad_to_multiple,

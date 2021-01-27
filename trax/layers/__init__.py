@@ -69,6 +69,7 @@ ThresholdedLinearUnit = layer_configure(ThresholdedLinearUnit)
 
 Attention = layer_configure(Attention, denylist=['mode'])
 CausalAttention = layer_configure(CausalAttention, denylist=['mode'])
+Favor = layer_configure(Favor, denylist=['mode'])
 CausalFavor = layer_configure(CausalFavor, denylist=['mode'])
 DotProductCausalAttention = layer_configure(
     DotProductCausalAttention, denylist=['mode'])
@@ -85,6 +86,9 @@ MultiplicativeConvCausalAttention = layer_configure(
     MultiplicativeConvCausalAttention, denylist=['mode'])
 ConvTranspose = layer_configure(ConvTranspose)
 LSHSelfAttention = layer_configure(LSHSelfAttention, denylist=['mode'])
+PureLSHSelfAttention = layer_configure(PureLSHSelfAttention, denylist=['mode'])
+PureLSHSelfAttentionWrapper = layer_configure(
+    PureLSHSelfAttentionWrapper, denylist=['mode'])
 EncDecAttention = layer_configure(EncDecAttention, denylist=['mode'])
 
 InfinitePositionalEncoding = layer_configure(
@@ -96,3 +100,5 @@ AtariConvInit = layer_configure(AtariConvInit)
 CrossEntropyLossWithLogSoftmax = layer_configure(CrossEntropyLossWithLogSoftmax)
 WeightedCategoryAccuracy = layer_configure(WeightedCategoryAccuracy)
 SequenceAccuracy = layer_configure(SequenceAccuracy)
+CategoryCrossEntropy = layer_configure(CategoryCrossEntropy)
+WeightedCategoryCrossEntropy = layer_configure(WeightedCategoryCrossEntropy)
