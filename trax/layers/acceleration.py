@@ -14,7 +14,7 @@
 # limitations under the License.
 
 # Lint as: python3
-"""Accelerate layer that allows for fast computation on accelerators."""
+"""Modifications to data and computation to use accelerators (better)."""
 
 import jax
 import numpy as np
@@ -36,21 +36,20 @@ class Accelerate(base.Layer):
   then 0-padding is added to make it divisible and the output may be affected
   if it relies on layers like batch normalization.
 
-  This layer does not require calling `init` if the underlying layer has
-  already been initialized, so it can be used as follows:
-  ```
-  layer = tl.Serial(...)
-  layer.init(...)
-  fast_layer = tl.Accelerate(layer)
-  y = fast_layer(x)  # Computes y splitting x on batch and running data-parallel
-  ```
+  This layer does not require calling ``init`` if the underlying layer has
+  already been initialized, so it can be used as follows::
+
+      layer = tl.Serial(...)
+      layer.init(...)
+      fast_layer = tl.Accelerate(layer)
+      y = fast_layer(x)  # Split x on batch and run data-parallel
 
   In case the weights of this layer need to be set using the weights of
-  the sublayer, use the `replicate_weights` function:
-  ```
-  # Instead of layer.weights = new_weights:
-  fast_layer.replicate_weights(new_weights)
-  ```
+  the sublayer, use the ``replicate_weights`` function::
+
+      # Instead of layer.weights = new_weights:
+      fast_layer.replicate_weights(new_weights)
+
   """
 
   def __init__(self, layer, n_devices=None):
@@ -66,7 +65,7 @@ class Accelerate(base.Layer):
     return self._sublayers[0]
 
   def pure_fn(self, x, weights, state, rng, use_cache=False):
-    """Calls self.sublayer.pure_fn in an accelerated way."""
+    """Calls ``self.sublayer.pure_fn`` in an accelerated way."""
     # Check if we can divide x evenly across devices.
     # Note: x can be a list/tuple because the underlying layer may take
     # its input as a list/tuple, ex: (inputs, targets, weight).
@@ -93,7 +92,7 @@ class Accelerate(base.Layer):
     return y, state
 
   def init(self, input_signature):
-    """Calls self.sublayer.init and replicated on multiple devices."""
+    """Calls ``self.sublayer.init`` and replicates its values onto devices."""
     weights, state = self.sublayer.init(input_signature, use_cache=True)
     self._weights = for_n_devices(weights, self._n_devices)
     self._state = for_n_devices(state, self._n_devices)
@@ -109,7 +108,7 @@ class Accelerate(base.Layer):
     self._state = for_n_devices(state, self._n_devices)
 
   def _unreplicate(self, x):
-    """Return a single-device version of x using the first component only."""
+    """Returns a single-device version of ``x``."""
     if self._n_devices < 2:
       return x
     return fastmath.nested_map(lambda y: y[0], x)
@@ -139,18 +138,14 @@ class Accelerate(base.Layer):
     self.sublayer.state = self._unreplicate(state)
 
 
+# TODO(jonni): Rename, since implementation does not use pmean.
 def mean_or_pmean(n_devices, x, axis=None):
-  """jnp.mean or pmean.
-
-  `x` is a distributed value. Directly calling jnp.mean on `x` means stacking
-  x's components together to form a large array and then doing jnp.mean on
-  it. In TF, stacking `x` will introduce D2H copy, so we use a collective
-  (pmean) here instead of directly calling jnp.mean for TF.
+  """Computes the mean of a distributed value ``x``.
 
   Args:
-    n_devices: number of devices.
-    x: a distributed array.
-    axis: the axis to reduce. Can only be 0 or None.
+    n_devices: Number of devices.
+    x: Distributed array.
+    axis: Axis along which to compute means; can only be ``0`` or ``None``.
 
   Returns:
     A local array.
@@ -167,7 +162,7 @@ def mean_or_pmean(n_devices, x, axis=None):
 
 
 def jit_forward(forward, n_devices, do_mean=True):
-  """Returns a JIT-compiled forward function running on `n_devices`."""
+  """Returns a JIT-compiled forward function running on ``n_devices``."""
   model_predict = _accelerate(forward, n_devices)
   # n_devices == 0 => CPU
   if n_devices < 2:
@@ -201,7 +196,7 @@ def _combine_devices(x_tuple):
 
 
 def _accelerate(f, n_devices):
-  """JIT-compiled version of `f` running on `n_devices`."""
+  """Returns an accelerated version of ``f`` running on ``n_devices``."""
   if n_devices == 0:  # no accelerators - run on CPU
     return fastmath.jit(f, device=jax.devices('cpu')[0])
 
@@ -212,7 +207,7 @@ def _accelerate(f, n_devices):
 
 
 def reshape_by_device(x, n_devices, pure_np=False):
-  """Reshapes possibly nested `x` into a shape `(n_devices, ...)`."""
+  """Reshapes possibly nested ``x`` into a shape ``(n_devices, ...)``."""
   def f(x):
     x_shape = list(x.shape)
     batch_size = x_shape[0]
@@ -229,10 +224,10 @@ def reshape_by_device(x, n_devices, pure_np=False):
 
 
 def for_n_devices(x, n_devices):
-  """Replicates/broadcasts `x` for `n_devices`."""
+  """Replicates/broadcasts ``x`` for ``n_devices``."""
   def f(x):
     if n_devices > 1 and fastmath.is_backend(fastmath.Backend.JAX):
-      return _multi_device_put(x)
+      return jax.device_put_replicated(x, jax.local_devices())
     elif n_devices > 1:
       return jnp.broadcast_to(x, (n_devices,) + jnp.asarray(x).shape)
     else:
@@ -241,12 +236,12 @@ def for_n_devices(x, n_devices):
 
 
 def on_cpu(x):
-  """Put the tensor x in CPU memory in JAX."""
+  """Puts ``x`` in CPU memory in JAX."""
   return jax.device_put(x, jax.devices('cpu')[0])
 
 
 def on_accelerator(x):
-  """Put the tensor x in (single) accelerator memory in JAX."""
+  """Puts ``x`` in (single) accelerator memory in JAX."""
   try:
     accelerator_devices = jax.devices('gpu')
   except RuntimeError:
@@ -258,38 +253,3 @@ def on_accelerator(x):
     return x
   assert len(accelerator_devices) == 1
   return jax.device_put(x, accelerator_devices[0])
-
-
-def _multi_device_put(x, devices=None):
-  """Memory efficient multi-device replication / broadcast in JAX.
-
-  JAX uses a ShardedDeviceArray class that holds a list of device buffers
-  on separate devices for use with pmap'd computations.  Sharded arrays
-  are explicitly used to eliminate unnecessary inter-device transfer of
-  memory buffers between use in pmap'd computations.  The JAX API currently
-  does not have a multi-device 'put' function that copies a buffer onto
-  N devices in a memory-efficient fashion, so we implement our own here.
-
-  Args:
-    x: jax DeviceArray or numpy ndarray to be replicated.
-    devices: a jax.devices() list or subset thereof of devices to
-      replicate onto.  Should match the list passed to any pmaps
-      ingesting the replicated array.
-
-  Returns:
-    A ShardedDeviceArray with
-    dtype = x.dtype and shape = (n_devices,) + x.shape
-    that's backed by replicated device_buffers on each local device.
-  """
-  # Calculate the abstract shape of the replicated array.
-  if not devices:
-    devices = jax.local_devices()
-  # The code below is equivalent to:
-  #   jax.api.device_put_sharded(len(devices) * [x], devices)
-  # but it does one PCI transfer and later uses ICI.
-  # TODO(lukaszkaiser): remove once JAX has a core function to do the same.
-  aval = jax.core.unmapped_aval(len(devices), 0,
-                                jax.core.raise_to_shaped(jax.core.get_aval(x)))
-  buf, = jax.xla.device_put(x, devices[0])  # assuming single-buf repr
-  rest_bufs = [buf.copy_to_device(d) for d in devices[1:]]
-  return jax.pxla.ShardedDeviceArray(aval, [buf, *rest_bufs])
