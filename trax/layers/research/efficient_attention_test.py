@@ -115,7 +115,7 @@ class EfficientAttentionTest(test.TestCase, parameterized.TestCase):
       self.assertEqual(jax.tree_structure(ref_weights_grad),
                        jax.tree_structure(test_weights_grad))
 
-      check_close = lambda x, y: self.assertAllClose(x, y, rtol=1e-3, atol=1e-3)
+      check_close = lambda x, y: self.assertAllClose(x, y, rtol=2e-3, atol=2e-3)
       fastmath.nested_map_multiarg(check_close, ref_out, test_out)
       fastmath.nested_map_multiarg(check_close, ref_state, test_state)
       fastmath.nested_map_multiarg(check_close, ref_inp_grad, test_inp_grad)
@@ -298,7 +298,6 @@ class EfficientAttentionTest(test.TestCase, parameterized.TestCase):
     with fastmath.use_backend(fastmath.Backend.JAX):
       n_heads = 5
       batch, seqlen, d_head = 3, 32, 8
-      num_weights = 2
       n_hashes = 2
       d_model = n_heads * d_head
       layer = efficient_attention.PureLSHSelfAttentionWrapper(

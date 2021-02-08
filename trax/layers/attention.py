@@ -570,7 +570,8 @@ class PositionalEncoding(base.Layer):
           emb.append(fastmath.dynamic_slice_in_dim(
               self.weights[0], state[i], inputs.shape[1], axis=0))
         self.state = state + inputs.shape[1]
-        return inputs + jnp.stack(emb, 0)
+        res = inputs + jnp.stack(emb, 0)
+        return res
 
   def init_weights_and_state(self, input_signature):
     """Randomly initializes the positional encoding vectors.
@@ -599,8 +600,7 @@ def _zero_pad(x, pad, axis):
   """Helper for jnp.pad with 0s for single-axis case."""
   pad_widths = [(0, 0)] * len(x.shape)
   pad_widths[axis] = pad  # Padding on axis.
-  return jnp.pad(x, pad_widths, mode='constant',
-                 constant_values=x.dtype.type(0))
+  return jnp.pad(x, pad_widths, mode='constant')
 
 
 def _fast_inference_init_state(input_signature, buffer_length):
@@ -637,10 +637,6 @@ def _fast_inference_update_state(inputs, state):
   Returns:
     Updated state.
   """
-  if not fastmath.is_backend(fastmath.Backend.JAX):
-    raise ValueError(f'JAX backend is required in predict mode, but found '
-                     f"backend ({fastmath.backend()['name']}).")
-
   # Fast inference: run step-by-step, storing the sequence
   # of keys and values calculated so far in state.
   (_, new_k, new_v) = inputs
