@@ -14,7 +14,17 @@
 # limitations under the License.
 
 # Lint as: python3
-"""Implementations of reversible layers."""
+"""Layers that can run in reverse to compute inputs from outputs.
+
+Reversible layers reduce the memory required for backpropagation-based
+training, especially for *deep* networks. In a series of reversible layers,
+input activations from a forward pass don't need to be stored: they can be
+reconstructed on the backward pass, layer by layer, from outputs to inputs.
+
+See, e.g., [The Reversible Residual Network: Backpropagation Without Storing
+Activations](https://arxiv.org/abs/1707.04585) and [Reformer: The Efficient
+Transformer](https://arxiv.org/abs/2001.04451).
+"""
 
 from absl import logging
 import jax
@@ -78,6 +88,24 @@ class ReversibleLayer(base.Layer):
     _, inputs_weights_grad = (
         self.reverse_and_grad(output, grad, weights, state, new_state, rng))
     return inputs_weights_grad
+
+
+class ReversibleConcatenatePair(ReversibleLayer):
+  """Maps (x, y) -> ([x, y], [x, y]);  [x, y] is concatenation on last axis."""
+
+  def __init__(self):
+    super().__init__(n_in=2, n_out=2)
+
+  def forward(self, inputs):
+    x, y = inputs
+    r = fastmath.numpy.concatenate((x, y), axis=-1)
+    return r, r
+
+  def reverse(self, outputs, weights=(), state=(), new_state=(), rng=None):
+    del state, new_state, rng, weights
+    pair, _ = outputs
+    x, y = fastmath.numpy.split(pair, 2, axis=-1)
+    return x, y
 
 
 class ReversibleSelect(ReversibleLayer):

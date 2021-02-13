@@ -16,10 +16,19 @@
 # Lint as: python3
 """Tests for trax.supervised.inputs."""
 
+import os
+
 from absl.testing import absltest
 from absl.testing import parameterized
 import numpy as np
 from trax import data
+
+pkg_dir, _ = os.path.split(__file__)
+_TESTDATA = os.path.join(pkg_dir, 'testdata')
+
+
+def _spm_path():
+  return os.path.join(_TESTDATA, 'sentencepiece.model')
 
 
 class InputsTest(parameterized.TestCase):
@@ -95,17 +104,78 @@ class InputsTest(parameterized.TestCase):
     self.assertLen(batch, 2)
     self.assertEqual(batch[0].shape, (10,))
 
+  def test_count_and_skip(self):
+    dataset = lambda _: ((i, i+1) for i in range(10))
+    examples = data.Serial(dataset, data.CountAndSkip('toy_data'))
+    ex_generator = examples()
+    ex1 = next(ex_generator)
+    self.assertEqual(ex1, (0, 1))
+    self.assertEqual(data.inputs.data_counters['toy_data'], 1)
+    ex2 = next(ex_generator)
+    self.assertEqual(ex2, (1, 2))
+    self.assertEqual(data.inputs.data_counters['toy_data'], 2)
+    ex3 = next(examples())  # new generator, will skip
+    self.assertEqual(ex3, (2, 3))
+    self.assertEqual(data.inputs.data_counters['toy_data'], 3)
+    data.inputs.data_counters['toy_data'] = 0  # reset
+    ex4 = next(examples())  # new generator, was reset
+    self.assertEqual(ex4, (0, 1))
+    self.assertEqual(data.inputs.data_counters['toy_data'], 1)
+
   def test_parallel(self):
     """Check that data.Serial works inside another data.Serial."""
-    dataset1 = lambda: (i for i in range(10))
-    dataset2 = lambda: (i for i in range(10, 20))
-    parallel = data.Parallel(dataset1, dataset2)
+    dataset1 = lambda _: (i for i in range(10))
+    dataset2 = lambda _: (i for i in range(10, 20))
+    parallel = data.Parallel([dataset1, dataset2])
     generator = parallel()
 
     self.assertEqual(next(generator), 0)
     self.assertEqual(next(generator), 10)
     self.assertEqual(next(generator), 1)
     self.assertEqual(next(generator), 11)
+    self.assertEqual(next(generator), 2)
+    self.assertEqual(next(generator), 12)
+
+  def test_parallel_with_weights(self):
+    """Check that data.Serial works inside another data.Serial."""
+    dataset1 = lambda _: (i for i in range(10))
+    dataset2 = lambda _: (i for i in range(10, 20))
+    parallel = data.Parallel([dataset1, dataset2], counters=(2, 1))
+    generator = parallel()
+
+    self.assertEqual(next(generator), 0)
+    self.assertEqual(next(generator), 10)
+    self.assertEqual(next(generator), 1)
+    self.assertEqual(next(generator), 11)
+    self.assertEqual(next(generator), 2)
+    self.assertEqual(next(generator), 3)
+    self.assertEqual(next(generator), 12)
+    self.assertEqual(next(generator), 4)
+    self.assertEqual(next(generator), 5)
+    self.assertEqual(next(generator), 13)
+
+  def test_parallel_with_weights_three_datasets(self):
+    """Check that data.Serial works inside another data.Serial."""
+    dataset1 = lambda _: (i for i in range(10))
+    dataset2 = lambda _: (i for i in range(10, 20))
+    dataset3 = lambda _: (i for i in range(20, 30))
+    parallel = data.Parallel(
+        [dataset1, dataset2, dataset3], counters=(2, 1, 3))
+    generator = parallel()
+
+    self.assertEqual(next(generator), 0)    # (1,0,0)
+    self.assertEqual(next(generator), 10)   # (1,1,0)
+    self.assertEqual(next(generator), 20)   # (1,1,1)
+    self.assertEqual(next(generator), 1)    # (2,1,1)
+    self.assertEqual(next(generator), 21)   # (2,1,2)
+    self.assertEqual(next(generator), 22)   # (2,1,3)
+    self.assertEqual(next(generator), 2)    # (1,0,0)
+    self.assertEqual(next(generator), 11)   # (1,1,0)
+    self.assertEqual(next(generator), 23)   # (1,1,1)
+    self.assertEqual(next(generator), 3)    # (2,1,1)
+    self.assertEqual(next(generator), 24)   # (2,1,2)
+    self.assertEqual(next(generator), 25)   # (2,1,3)
+    self.assertEqual(next(generator), 4)    # (1,0,0)
 
   def test_serial_with_python(self):
     dataset = lambda _: ((i, i+1) for i in range(10))
@@ -334,6 +404,147 @@ class InputsTest(parameterized.TestCase):
       self.assertEqual(y.shape[1], seq_length)
       self.assertEqual(weights.shape[1], seq_length)
 
+  def _get_span_lengths(self, x):
+    span_lengths = []
+    curr_len = 0
+    for i in range(1, len(x)):
+      # 1 -> 0
+      if x[i] == 0 and x[i - 1] == 1:
+        span_lengths.append(curr_len)
+        curr_len = 0
+      # 1 -> 1 or 0 -> 1
+      elif ((x[i] == 1 and x[i - 1] == 1) or
+            (x[i] == 1 and x[i - 1] == 0)):
+        curr_len += 1
+    if curr_len != 0:
+      span_lengths.append(curr_len)
+    return span_lengths
+
+  def test_random_spans_noise_mask(self):
+    length = 100
+    noise_density = 0.15
+    mean_noise_span_length = 3.0
+
+    # Take 5 random seed1, seed2 values.
+    for seed in np.random.randint(0, 100, (5, 2)):
+      is_noise = data.random_spans_noise_mask(length,
+                                              noise_density,
+                                              mean_noise_span_length,
+                                              seed1=seed[0],
+                                              seed2=seed[1])
+      is_noise = is_noise.astype(np.int32)
+      # noise_density fraction of tokens are produced
+      self.assertEqual(np.sum(is_noise), noise_density * length)
+      # Get span lengths and make sure the average is what we expect.
+      actual_span_lengths = self._get_span_lengths(is_noise)
+      average_span_length = (
+          sum(actual_span_lengths) / len(actual_span_lengths))
+      self.assertEqual(mean_noise_span_length, average_span_length)
+
+  def test_process_c4_with_span_corruption(self):
+    def process_c4_with_span_corruption(spm_path=None,
+                                        extra_ids=0,
+                                        train=False,
+                                        max_length=100,
+                                        noise_density=0.15,
+                                        mean_noise_span_length=3.0,
+                                        seed1=None,
+                                        seed2=None):
+      return data.Serial(
+          data.TFDS(
+              'c4/en:2.3.0', data_dir=_TESTDATA, keys=('text',), train=train),
+          data.SentencePieceTokenize(spm_path=spm_path, extra_ids=extra_ids),
+          data.generate_sequential_chunks(max_length=max_length),
+          data.generate_random_noise_mask(
+              noise_density=noise_density,
+              mean_noise_span_length=mean_noise_span_length,
+              seed1=seed1, seed2=seed2),
+          data.consume_noise_mask(vocab_size=32000 + extra_ids),
+          data.FilterEmptyExamples(),
+          data.AppendValue(val={0: [1], 1: [1]}),
+          data.PadToLength(len_map={0: 100, 1: 30}, pad_value={0: 0, 1: 0}),
+          data.AddLossWeights(id_to_mask=0),
+          data.Batch(batch_size=2)
+          )
+
+    gen = process_c4_with_span_corruption(
+        spm_path=_spm_path(), seed1=0, seed2=1)
+
+    examples = []
+    for i, ex in enumerate(gen()):
+      if i == 100:
+        break
+      examples.append(ex)
+
+    self.assertLen(examples, 100)
+    example = examples[0]
+
+    batched_input, batched_output, batched_loss_weights = example
+
+    self.assertSequenceEqual(
+        batched_input.tolist(),
+        # pylint: disable=bad-continuation,bad-whitespace
+        [[   37,  2335,   113,  3977,   227,  7306,    45,     3,     9,
+           4716,   147,     8,    71,  2658,    65,   118,  4313,    38,
+              3,     9, 13065,    32, 31999,     9,  5704,    26,   109,
+              6,  6862,     6,  4728,    45,     8,  3796, 24093, 11834,
+           4716,    30,     8,  1379,    13, 31998,   130,   718,    12,
+              8, 24124,  1343,   300,  4357,  1714, 31997,  1373,    47,
+          16487,  3168,    16,   321,  7943,     5,     3,  4868,  3856,
+           5700,    75,     7,   200,  2231,     6, 11163,     9,     6,
+            113,    47,  5330,    45, 14354,     6,    47, 31996, 20721,
+           3654,    44,     8,  3112,     5, 14599,    11,  8067, 31995,
+              1,     0,     0,     0,     0,     0,     0,     0,     0,
+              0],
+         [  277,   828,    43,  5899,    46,    16, 10952,   139,   160,
+           1687,    56,   539,    30,  2875,    41, 31122,  2307,   137,
+           2702,  2780,    15,     7, 31999,    44,     8,  3112,    11,
+             30,   569,   783,     5,     3, 17701,     6,  2194,    26,
+             23,  1336,  6321,  1694,    30, 31998,   196,    56,  1852,
+           1423,    25,     5,    27,   183,  8032, 31997,   217,   149,
+           1513,    11,  2238,    25,  1800,     5,    96,  2703,    44,
+           3065, 12537, 11163,     9,   535,    71,  9363, 14886,   646,
+             44,     8,  3112,   243, 23281,    12,     8, 31996,   346,
+            402,    17,    99,    83,    11,   773,  3668,  1280, 31995,
+              1,     0,     0,     0,     0,     0,     0,     0,     0,
+              0]]
+        # pylint: enable=bad-continuation,bad-whitespace
+        )
+
+    self.assertSequenceEqual(
+        batched_output.tolist(),
+        # pylint: disable=bad-continuation,bad-whitespace
+        [[31999,  1639,     7, 15480,     5, 11163, 31998,  2083,  9997,
+           5076, 31997,   265,    11,     8, 31996,     3, 31995,  1343,
+           2487,   106,     1,     0,     0,     0,     0,     0,     0,
+              0,     0,     0],
+         [31999,    12,     8, 15480,   130,   646, 31998,  1376,    10,
+             96, 31997,    62,   410,    59, 31996,    96, 31995,    94,
+            608,    10,     1,     0,     0,     0,     0,     0,     0,
+              0,     0,     0]]
+        # pylint: enable=bad-continuation,bad-whitespace
+        )
+
+    self.assertSequenceEqual(
+        batched_loss_weights.tolist(),
+        # pylint: disable=bad-continuation,bad-whitespace
+        [[1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1.,
+          1., 1., 1., 1., 1., 0., 0., 0., 0., 0., 0., 0., 0., 0.],
+         [1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1.,
+          1., 1., 1., 1., 1., 0., 0., 0., 0., 0., 0., 0., 0., 0.]]
+        # pylint: enable=bad-continuation,bad-whitespace
+        )
+
+  def test_generate_prefix_lm_sequential_chunks(self):
+    chunker_fn = data.generate_prefix_lm_sequential_chunks(max_length=3)
+    examples = list(chunker_fn([[1, 2, 3, 4, 5, 6, 7]]))
+    self.assertSequenceEqual(([1, 2, 3], [4, 5, 6]), examples[0])
+    self.assertSequenceEqual(([4, 5, 6], [7]), examples[1])
+
+  def test_generate_prefix_lm_sequential_chunks_short_chunks(self):
+    chunker_fn = data.generate_prefix_lm_sequential_chunks(max_length=10)
+    examples = list(chunker_fn([[1, 2, 3, 4, 5, 6, 7]]))
+    self.assertSequenceEqual(([1, 2, 3], [4, 5, 6, 7]), examples[0])
 
 if __name__ == '__main__':
   absltest.main()

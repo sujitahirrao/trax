@@ -19,6 +19,7 @@
 import functools
 import math
 import random as pyrandom
+import numpy as np
 
 from trax import fastmath
 from trax import layers as tl
@@ -599,7 +600,8 @@ def MultiplicativeModularCausalAttention(
 @assert_shape('bld->bld')
 def MultiplicativeConvCausalAttention(
     d_feature, n_heads=1, sparsity=None, length_kernel_size=3,
-    dropout=0.0, max_inference_length=2048, mode='train'):
+    dropout=0.0, max_inference_length=2048, share_qk=False,
+    output_layer_type='none', v_concat_type='none', mode='train'):
   """Returns a layer that maps activations to activations, with causal masking.
 
   Like `CausalAttention`, this layer type represents one pass of multi-head
@@ -615,10 +617,83 @@ def MultiplicativeConvCausalAttention(
     dropout: Probababilistic rate for internal dropout applied to attention
         activations (based on query-key pairs) before dotting them with values.
     max_inference_length: maximum length for inference.
+    share_qk: if True, average Q and K embeddings and share for both Q and K.
+    output_layer_type: Which sparse layers to use for processing output from the
+        attention mechanism. One of `'none'`, `'mult'`, `'conv'`,
+        or `'multconv'`.
+    v_concat_type: What kind of concatenation to use when computing V tensor.
+        One of `'original'`, `'fixed'`, or `'none'`. `'none'` means using just
+        output from mutliplicative layer shared by Q, K, V. `'fixed'` means
+        using output from multiplicative layer concatenated, for each module,
+        with the layer input. `'original'` means using concatenation without
+        properly taking modules into account; this method was used in
+        experiments previously, so it is included for backwards-compatibility.
     mode: One of `'train'`, `'eval'`, or `'predict'`.
   """
+  assert output_layer_type in ['none', 'mult', 'conv', 'multconv']
+  assert v_concat_type in ['original', 'fixed', 'none']
+
   sparsity = n_heads if sparsity is None else sparsity
   d_module = d_feature // sparsity
+
+  output_layers = []
+  if 'mult' in output_layer_type:
+    output_layers.append(MultiplicativeSparseDense(
+        sparsity, d_feature, d_feature))
+  if 'conv' in output_layer_type:
+    output_layers.append(LocallyConvDense(
+        sparsity, d_module, mode=mode, kernel_size=3,
+        length_kernel_size=length_kernel_size))
+
+  if v_concat_type == 'original':
+    # 'original'` uses concatenation without properly taking modules into
+    # account; this method was used in experiments previously, so it is included
+    # for backwards-compatibility.
+    concat_layers = [tl.Concatenate()]  # use permuted and original for v
+  elif v_concat_type == 'fixed':
+    # `'fixed'` uses the output from multiplicative layer concatenated, for each
+    # module, with the layer input. This means that every module in Conv layer
+    # has access both to parts of embeddings which were used to compute Q/K of
+    # this particular module, and it ha access to parts of the embedding which
+    # will be modified by this module.
+    concat_layers = [
+        tl.Parallel(
+            tl.Fn('Reshape1', lambda x: jnp.reshape(  # pylint: disable=g-long-lambda
+                x, (x.shape[0], x.shape[1], sparsity, d_module))),
+            tl.Fn('Reshape2', lambda x: jnp.reshape(  # pylint: disable=g-long-lambda
+                x, (x.shape[0], x.shape[1], sparsity, d_module)))),
+        tl.Concatenate(),
+        tl.Fn('Reshape3',
+              lambda x: jnp.reshape(x, (x.shape[0], x.shape[1], 2*d_feature))),
+    ]
+  elif v_concat_type == 'none':
+    # `'none'` doesn't use concatenation: we throw away the original layer
+    # input and pass to Conv only output of shared Multiplicative layer.
+    concat_layers = [tl.Select([0], n_in=2)]
+
+  if share_qk:
+    return tl.Serial(
+        tl.Select([0, 0]),  # pre-qkv, pre-v-for-concat
+        MultiplicativeSparseDense(sparsity, d_feature, d_feature),  # shared q k
+        tl.Select([0, 0]),  # pre-qk, pre-v, pre-v-for-concat
+        LocallyConvDense(sparsity, d_module, mode=mode, kernel_size=3,
+                         length_kernel_size=length_kernel_size),
+        tl.SplitIntoHeads(n_heads),
+        tl.Select([0, 0]),  # use for q and k
+        tl.Parallel(
+            [],
+            [],
+            [concat_layers,
+             LocallyConvDense(sparsity, d_module, mode=mode, kernel_size=1,
+                              length_kernel_size=length_kernel_size),
+             tl.SplitIntoHeads(n_heads)],
+        ),
+        tl.DotProductCausalAttention(
+            dropout=dropout, max_inference_length=max_inference_length,
+            mode=mode),
+        tl.MergeHeads(n_heads),
+        output_layers,
+    )
   return tl.Serial(
       tl.Select([0, 0]),  # duplicate activations
       MultiplicativeSparseDense(sparsity, d_feature, d_feature),  # shared q, k
@@ -630,7 +705,7 @@ def MultiplicativeConvCausalAttention(
           [LocallyConvDense(sparsity, d_module, mode=mode, kernel_size=3,
                             length_kernel_size=length_kernel_size),
            tl.SplitIntoHeads(n_heads)],
-          [tl.Concatenate(),  # use permuted and original for v
+          [concat_layers,
            LocallyConvDense(sparsity, d_module, mode=mode, kernel_size=1,
                             length_kernel_size=length_kernel_size),
            tl.SplitIntoHeads(n_heads)],
@@ -639,6 +714,7 @@ def MultiplicativeConvCausalAttention(
           dropout=dropout, max_inference_length=max_inference_length,
           mode=mode),
       tl.MergeHeads(n_heads),
+      output_layers,
   )
 
 
@@ -858,11 +934,11 @@ class _SparseFFController(base.Layer):
   """The controller part of Sparse Feed-Forward layer."""
 
   def __init__(self, d_ff, n_elements_in_block, d_lowrank, temperature,
-               use_bfloat16, mode, kernel_initializer, bias_initializer):
+               use_bfloat16, mode, kernel_initializer, bias_initializer,
+               also_return_nondiscrete_output):
     """Returns a sparse feed-forward block."""
-    n_out = 2 if mode == 'train' else 1
+    n_out = 2 if also_return_nondiscrete_output else 1
     super().__init__(name=f'_SparseFFController_{d_ff}', n_out=n_out)
-    self._mode = mode
     self._use_bfloat16 = use_bfloat16
     self._d_ff = d_ff
     self._d_lowrank = d_lowrank
@@ -875,6 +951,7 @@ class _SparseFFController(base.Layer):
     assert self._d_ff % self._n_elements_in_block == 0
     self._d1 = self._d_ff // self._n_elements_in_block
     self._d2 = self._n_elements_in_block
+    self._also_return_nondiscrete_output = also_return_nondiscrete_output
 
   def forward(self, x):
     """Executes this layer as part of a forward pass through the model.
@@ -893,19 +970,25 @@ class _SparseFFController(base.Layer):
     x = jnp.reshape(x, [-1, x_shape[-1]])  # Easier to operate on flattened x.
 
     # Q: should we add bias and/or put relu after the low-rank m1 dot?
+    # TODO(jaszczur): replacing multiplication and reshape by this einsum may
+    # bring training speed improvement (see also reshape in initialization).
+    # mask_logits = jnp.einsum('bd,dl,lxy->bxy', x, m1, m2) + mb
     mask_logits = jnp.dot(jnp.dot(x, m1), m2) + mb
     mask_logits = jnp.reshape(mask_logits, [-1, self._d1, self._d2])
 
-    if self._mode == 'train':
+    if self._also_return_nondiscrete_output:
       # Softmax.
       mask_logsumexp = fastmath.logsumexp(mask_logits, axis=-1, keepdims=True)
       log_mask = mask_logits - mask_logsumexp
       mask = jnp.exp(log_mask)
       # Gumbel-softmax with straight-through discretization.
-      u = fastmath.random.uniform(self.rng, mask.shape, jnp.float32, 1e-6,
-                                  1.0 - 1e-6)
-      g = -jnp.log(-jnp.log(u))
-      quant_mask = jnp.argmax(log_mask + g * self._temperature, axis=-1)
+      if self._temperature == 0.0:
+        quant_mask = jnp.argmax(log_mask, axis=-1)
+      else:
+        u = fastmath.random.uniform(self.rng, mask.shape, jnp.float32, 1e-6,
+                                    1.0 - 1e-6)
+        g = -jnp.log(-jnp.log(u))
+        quant_mask = jnp.argmax(log_mask + g * self._temperature, axis=-1)
       return quant_mask, mask
     else:
       quant_mask = jnp.argmax(mask_logits, axis=-1)
@@ -927,6 +1010,10 @@ class _SparseFFController(base.Layer):
       m2 = m2.astype(jnp.bfloat16)
       mb = mb.astype(jnp.bfloat16)
 
+    # Reshapes below, with einsum in feedforward, should improve training speed.
+    # m2 = jnp.reshape(m2, [self._d_lowrank, self._d1, self._d2])
+    # mb = jnp.reshape(mb, [self._d1, self._d2])
+
     self.weights = (m1, m2, mb)
 
 
@@ -935,9 +1022,9 @@ class _SparseFFMain(base.Layer):
 
   def __init__(self, d_ff, n_elements_in_block, d_lowrank, quant_prob,
                use_bfloat16, big_weights_in_bfloat16, mode, kernel_initializer,
-               bias_initializer):
+               bias_initializer, multiply_by_controller_output):
     """Returns a sparse feed-forward block."""
-    n_in = 3 if mode == 'train' else 2
+    n_in = 3 if mode == 'train' or multiply_by_controller_output else 2
     super().__init__(name=f'_SparseFFMain_{d_ff}', n_in=n_in)
     self._mode = mode
     self._use_bfloat16 = use_bfloat16
@@ -952,6 +1039,7 @@ class _SparseFFMain(base.Layer):
     assert self._d_ff % self._n_elements_in_block == 0
     self._d1 = self._d_ff // self._n_elements_in_block
     self._d2 = self._n_elements_in_block
+    self._multiply_by_controller_output = multiply_by_controller_output
 
   def forward(self, x):
     """Executes this layer as part of a forward pass through the model.
@@ -963,21 +1051,16 @@ class _SparseFFMain(base.Layer):
     Returns:
       Tensor of same shape and dtype as the input.
     """
-    if self._mode == 'train':
+    if self._mode == 'train' or self._multiply_by_controller_output:
       quant_mask, mask, x = x
     else:
       quant_mask, x = x
 
     w1, w2, b2 = self.weights
-    if self._mode != 'predict':
-      w1 = jnp.reshape(w1.T, (-1, self._d_ff))
-      w2 = jnp.reshape(w2, (self._d_ff, -1))
-    else:
-      # This is a work-around of a bug in the previous if statement, which makes
-      # w1 array shuffled. Fixing it properly would invalidate previous
-      # checkpoints, so this is a temporary work-around.
-      w1 = jnp.transpose(w1, (1, 0, 2))
-      w1 = jnp.reshape(w1, (self._d1, self._d2, -1))
+
+    if self._mode == 'predict':
+      w1 = jnp.transpose(w1, (1, 2, 0))  # dm, d1, d2 -> d1, d2, dm
+      w2 = jnp.transpose(w2, (1, 0, 2))  # d2, d1, dm -> d1, d2, dm
     x_shape = x.shape
     x = jnp.reshape(x, [-1, x_shape[-1]])  # Easier to operate on flattened x.
 
@@ -990,16 +1073,21 @@ class _SparseFFMain(base.Layer):
       # of the quantized mask to improve training stability (see paper above).
       select = fastmath.random.uniform(self.rng, (), jnp.float32, 0.0, 1.0)
       quant_mask = jnp.where(select < self._quant_prob, quant_mask, mask)
-      quant_mask = jnp.reshape(quant_mask, [-1, self._d_ff])
 
-    if self._mode == 'train':
       # In training, run full matmul to get benefits from the above tricks.
-      mid = jnp.dot(x, w1) * quant_mask  # [joint_batch, d_ff]
+      mid = jnp.einsum('bd,dxy->bxy', x, w1) * quant_mask
       relu = jnp.where(mid <= 0, jnp.zeros_like(mid), mid)
-      res = jnp.dot(relu, w2) + b2
+      if self._multiply_by_controller_output:
+        # We multiply only for quantized decisions, since for non-quantized
+        # decisions we've already multiplied the output.
+        mask_mult = jnp.where(select < self._quant_prob,
+                              mask, jnp.ones_like(mask))
+        # Stop-gradient is here, because we already have a pass-through gradient
+        # (for quantized decisions).
+        mask_mult = fastmath.stop_gradient(mask_mult)
+        relu = relu * mask_mult
+      res = jnp.einsum('bxy,yxd->bd', relu, w2) + b2
     elif self._mode == 'predict':
-      # w1 = jnp.reshape(w1.T, (self._d1, self._d2, -1))
-      # w2 = jnp.reshape(w2, (self._d1, self._d2, -1))
       # This implementation mimicks inference. It's not efficient for large
       # size of joint_batch, but at inference that will be 1 most of the time.
       # Shapes:
@@ -1016,16 +1104,20 @@ class _SparseFFMain(base.Layer):
       w = jnp.reshape(w, [batch_size, self._d1, -1])
       mid = jnp.einsum('ai,aji->aj', x, w)
       relu = jnp.where(mid <= 0, jnp.zeros_like(mid), mid)
+      if self._multiply_by_controller_output:
+        mask_mult = jnp.take_along_axis(mask, quant_mask[..., None], -1)[..., 0]
+        relu = relu * mask_mult
       # w2 is [self._d1, self._d2, d_model]
       v = w2[idx1, idx2, :]
       v = jnp.reshape(v, [batch_size, self._d1, -1])
       res = jnp.einsum('ai,aij->aj', relu, v) + b2
     else:
       quant_mask = tl.one_hot(quant_mask, self._n_elements_in_block)
-      quant_mask = jnp.reshape(quant_mask, [-1, self._d_ff])
-      mid = jnp.dot(x, w1) * quant_mask  # [joint_batch, d_ff]
+      mid = jnp.einsum('bd,dxy->bxy', x, w1) * quant_mask
       relu = jnp.where(mid <= 0, jnp.zeros_like(mid), mid)
-      res = jnp.dot(relu, w2) + b2
+      if self._multiply_by_controller_output:
+        relu = relu * mask
+      res = jnp.einsum('bxy,yxd->bd', relu, w2) + b2
 
     return jnp.reshape(res, x_shape)  # un-flatten if needed
 
@@ -1046,8 +1138,8 @@ class _SparseFFMain(base.Layer):
       w1 = w1.astype(jnp.bfloat16)
       w2 = w2.astype(jnp.bfloat16)
 
-    w1 = jnp.reshape(w1.T, (self._d1, self._d2, -1))
-    w2 = jnp.reshape(w2, (self._d1, self._d2, -1))
+    w1 = jnp.reshape(w1, (-1, self._d1, self._d2))
+    w2 = jnp.reshape(w2, (self._d2, self._d1, -1))
 
     self.weights = (w1, w2, b2)
 
@@ -1057,7 +1149,8 @@ def SparseFF(
     use_bfloat16=False, big_weights_in_bfloat16=False, mode='train',
     kernel_initializer=init.GlorotUniformInitializer(),
     bias_initializer=init.RandomNormalInitializer(1e-6),
-    dropout_rate=0.0, dropout_shared_axes=None, ff_chunk_size=0):
+    dropout_rate=0.0, dropout_shared_axes=None, ff_chunk_size=0,
+    multiply_by_controller_output=False):
   """Returns Feed-forward block with sparsity.
 
   The original (non-sparse) FF block is a triple Dense(d_ff)-Relu-Dense
@@ -1092,14 +1185,21 @@ def SparseFF(
       way to save memory and apply consistent masks to activation vectors at
       different sequence positions.
     ff_chunk_size: int; if > 0, chunk feed-forward into this-sized chunks.
+    multiply_by_controller_output: whether to multiply the middle activation
+      layer of FF by controller output (i.e. softmax).
   """
 
+  if mode == 'train' or multiply_by_controller_output:
+    also_return_nondiscrete_output = True
+  else:
+    also_return_nondiscrete_output = False
   controller = _SparseFFController(
       d_ff=d_ff, n_elements_in_block=n_elements_in_block,
       d_lowrank=d_lowrank, temperature=temperature,
       use_bfloat16=use_bfloat16, mode=mode,
       kernel_initializer=kernel_initializer,
-      bias_initializer=bias_initializer)
+      bias_initializer=bias_initializer,
+      also_return_nondiscrete_output=also_return_nondiscrete_output)
 
   main = [
       _SparseFFMain(
@@ -1107,7 +1207,8 @@ def SparseFF(
           d_lowrank=d_lowrank, quant_prob=quant_prob, use_bfloat16=use_bfloat16,
           big_weights_in_bfloat16=big_weights_in_bfloat16, mode=mode,
           kernel_initializer=kernel_initializer,
-          bias_initializer=bias_initializer),
+          bias_initializer=bias_initializer,
+          multiply_by_controller_output=multiply_by_controller_output),
       tl.Dropout(rate=dropout_rate, shared_axes=dropout_shared_axes, mode=mode),
   ]
 
@@ -1133,13 +1234,13 @@ class BlockSparseFF(base.Layer):
 
   This block sparse layer mimics mixture of experts architecture.
   It divides the dimension of d_ff in each weight matrix to # of blocks equal to
-  num_experts and activates only one non-zero block from the weights matrix.
+  n_experts and activates only one non-zero block from the weights matrix.
   This is trained with straight-through Gumbel softmax trick.
   """
 
   def __init__(self,
                d_ff,
-               num_experts=64,
+               n_experts=64,
                temperature=0.7,
                mode='train',
                kernel_initializer=init.GlorotUniformInitializer(),
@@ -1148,12 +1249,12 @@ class BlockSparseFF(base.Layer):
     super().__init__(name=f'BlockSparseFF_{d_ff}')
     self._mode = mode
     self._d_ff = d_ff
-    self._num_experts = num_experts
+    self._n_experts = n_experts
     self._temperature = temperature if mode == 'train' else 0.0
-    self._n_elements_in_block = d_ff // num_experts
+    self._n_elements_in_block = d_ff // n_experts
     self._kernel_initializer = kernel_initializer
     self._bias_initializer = bias_initializer
-    assert self._d_ff % self._num_experts == 0
+    assert self._d_ff % self._n_experts == 0
 
   def forward(self, x):
     """Executes this layer as part of a forward pass through the model.
@@ -1183,7 +1284,7 @@ class BlockSparseFF(base.Layer):
     selected_experts = jnp.argmax(log_mask + g * self._temperature, axis=-1)
     if self._mode == 'train':
       # Tricks from Section 2.1 in https://arxiv.org/abs/1801.09797
-      quant_mask = tl.one_hot(selected_experts, self._num_experts)
+      quant_mask = tl.one_hot(selected_experts, self._n_experts)
       quant_mask = fastmath.stop_gradient(quant_mask)
       quant_mask += mask - fastmath.stop_gradient(mask)  # straight-through
       # We will sometimes (50% of the batches) use the soft-mask instead of
@@ -1192,9 +1293,8 @@ class BlockSparseFF(base.Layer):
       select = fastmath.random.uniform(rng2, (), jnp.float32, -1.0, 1.0)
       quant_mask = jnp.where(select > 0.0, quant_mask, mask)
     else:
-      quant_mask = tl.one_hot(selected_experts, self._num_experts)
-    quant_mask = jnp.reshape(quant_mask, [-1, self._num_experts, 1])
-    quant_mask_shape = quant_mask.shape
+      quant_mask = tl.one_hot(selected_experts, self._n_experts)
+    quant_mask = jnp.reshape(quant_mask, [-1, self._n_experts, 1])
     batch_size = quant_mask.shape[0]
 
     if self._mode == 'predict' and batch_size == 1:
@@ -1213,7 +1313,7 @@ class BlockSparseFF(base.Layer):
     else:
       expanded_mask = jnp.broadcast_to(
           quant_mask,
-          (quant_mask_shape[0], quant_mask.shape[1], self._n_elements_in_block))
+          (quant_mask.shape[0], quant_mask.shape[1], self._n_elements_in_block))
       expanded_mask = jnp.reshape(expanded_mask, (-1, self._d_ff))
       mid = jnp.dot(x, w1) * expanded_mask  # [joint_batch, d_ff]
       relu = jnp.where(mid <= 0, jnp.zeros_like(mid), mid)
@@ -1224,7 +1324,116 @@ class BlockSparseFF(base.Layer):
   def init_weights_and_state(self, input_signature):
     """Randomly initializes this layer's weights."""
     d_model = input_signature.shape[-1]
-    shape_m1 = (d_model, self._num_experts)
+    shape_m1 = (d_model, self._n_experts)
+    shape_w1 = (d_model, self._d_ff)
+    shape_w2 = (self._d_ff, d_model)
+    shape_b2 = (d_model,)
+
+    rng_m1, rng_w1, rng_w2, rng_b2 = fastmath.random.split(self.rng, 4)
+    m1 = self._kernel_initializer(shape_m1, rng_m1)
+    w1 = self._kernel_initializer(shape_w1, rng_w1)
+    w2 = self._kernel_initializer(shape_w2, rng_w2)
+    b2 = self._bias_initializer(shape_b2, rng_b2)
+
+    self.weights = (m1, w1, w2, b2)
+
+
+class SwitchSparseFF(base.Layer):
+  """Feed-forward block with switch-style block sparsity.
+
+  The original (non-sparse) FF block is a triple Dense(d_ff)-Relu-Dense
+  that takes an input, makes it of size d_ff (usually larger than it was) and
+  then brings it back to the original size after Relu. It is commonly used in
+  Transformer models where it often accounts for most of the trainable weights.
+
+  This block sparse layer mimics mixture of experts architecture.
+  It divides the dimension of d_ff in each weight matrix to # of blocks equal to
+  n_experts and activates only one non-zero block from the weights matrix.
+  This is trained with methods following the Switch Transformer.
+  """
+
+  def __init__(self,
+               d_ff,
+               n_experts=64,
+               temperature=0.1,
+               mode='train',
+               kernel_initializer=init.GlorotUniformInitializer(),
+               bias_initializer=init.RandomNormalInitializer(1e-6)):
+    """Returns a switch-style training block sparse feed-forward block."""
+    super().__init__(name=f'SwitchSparseFF_{d_ff}')
+    self._mode = mode
+    self._d_ff = d_ff
+    self._n_experts = n_experts
+    self._temperature = temperature if mode == 'train' else 0.0
+    self._n_elements_in_block = d_ff // n_experts
+    self._kernel_initializer = kernel_initializer
+    self._bias_initializer = bias_initializer
+    assert self._d_ff % self._n_experts == 0
+
+  def forward(self, x):
+    """Executes this layer as part of a forward pass through the model.
+
+    Args:
+      x: Tensor of same shape and dtype as the input signature used to
+        initialize this layer.
+
+    Returns:
+      Tensor of same shape and dtype as the input.
+    """
+    m1, w1, w2, b2 = self.weights
+    x_shape = x.shape
+    x = jnp.reshape(x, [-1, x_shape[-1]])  # Easier to operate on flattened x.
+
+    # Q: check if we need bias and/or put relu after the m1 dot?
+    mask_logits = jnp.dot(x, m1)
+    # Softmax.
+    mask_logsumexp = fastmath.logsumexp(mask_logits, axis=-1, keepdims=True)
+    log_mask = mask_logits - mask_logsumexp
+    mask = jnp.exp(log_mask)
+    # Gumbel noise to allow sampling from the softmax.
+    rng1, _ = fastmath.random.split(self.rng, 2)
+    u = fastmath.random.uniform(rng1, mask.shape, jnp.float32, 1e-6, 1.0 - 1e-6)
+    g = -jnp.log(-jnp.log(u))
+    selected_experts = jnp.argmax(log_mask + g * self._temperature, axis=-1)
+    quant_mask = tl.one_hot(selected_experts, self._n_experts)
+    quant_mask = fastmath.stop_gradient(quant_mask)
+    quant_mask *= mask  # go to just the selected expert
+    quant_mask = jnp.reshape(quant_mask, [-1, self._n_experts, 1])
+    batch_size = quant_mask.shape[0]
+
+    if self._mode == 'predict' and batch_size == 1:
+      mask_flat = jnp.reshape(mask, [-1, self._n_experts])
+      selected_flat = jnp.reshape(selected_experts, [-1])
+      selected_mask_flat = mask_flat[np.arange(selected_flat.size),
+                                     selected_flat]
+      # This implementation mimicks inference for batch_size 1.
+      start_idx = selected_experts[0] * self._n_elements_in_block
+      # w1 is [d_model, d_ff], w is [d_model, n_elements_in_block]
+      w = fastmath.dynamic_slice(w1, [0, start_idx],
+                                 [w1.shape[0], self._n_elements_in_block])
+      mid = jnp.dot(x, w)
+      mid *= jnp.reshape(selected_mask_flat, mid.shape[:-1])[..., None]
+      relu = jnp.where(mid <= 0, jnp.zeros_like(mid), mid)
+      # w2 is [d_ff, d_model], v is [n_elements_in_block, d_model]
+      v = fastmath.dynamic_slice(w2, [start_idx, 0],
+                                 [self._n_elements_in_block, w2.shape[-1]])
+      v = jnp.reshape(v, [self._n_elements_in_block, -1])
+      res = jnp.dot(relu, v) + b2
+    else:
+      expanded_mask = jnp.broadcast_to(
+          quant_mask,
+          (quant_mask.shape[0], quant_mask.shape[1], self._n_elements_in_block))
+      expanded_mask = jnp.reshape(expanded_mask, (-1, self._d_ff))
+      mid = jnp.dot(x, w1) * expanded_mask  # [joint_batch, d_ff]
+      relu = jnp.where(mid <= 0, jnp.zeros_like(mid), mid)
+      res = jnp.dot(relu, w2) + b2
+
+    return jnp.reshape(res, x_shape)  # un-flatten if needed
+
+  def init_weights_and_state(self, input_signature):
+    """Randomly initializes this layer's weights."""
+    d_model = input_signature.shape[-1]
+    shape_m1 = (d_model, self._n_experts)
     shape_w1 = (d_model, self._d_ff)
     shape_w2 = (self._d_ff, d_model)
     shape_b2 = (d_model,)

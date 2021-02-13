@@ -69,12 +69,16 @@ lines from `my_file.txt` as follows::
 """
 
 import math
+import os
+import pickle
 import random
+import zlib
 
 from absl import logging
-
 import gin
+import jax
 import numpy as np
+import tensorflow as tf
 
 from trax import fastmath
 from trax import shapes
@@ -91,15 +95,57 @@ def Serial(*fns):  # pylint: disable=invalid-name
   return composed_fns
 
 
-def Parallel(*fns):  # pylint: disable=invalid-name
-  """Combines generator functions into one that runs them in parallel."""
-  def parallel_generator():
+def Parallel(fns=None, counters=None):  # pylint: disable=invalid-name
+  """Combines generator functions into one that runs them in parallel.
+
+  Args:
+    fns: a sequence of datasets which are combined in parallel.
+    counters: a sequence of ints with same length as fns, please see comments on
+      its use below.
+  Returns:
+    parallel_generator: the generator yields samples according to given;
+    if counters are not given then samples are genereted uniformly.
+
+  Example 1:
+
+    gen = data.Parallel([dataset1, dataset2, dataset3], counters=(2, 1, 3))
+
+  defines a generator that yields 33% examples from dataset1, 16% examples from
+  dataset2 and 50% examples from dataset3.
+
+  Example 2:
+
+    gen = data.Parallel([dataset1, dataset2, dataset3], counters=(20, 50, 30))
+
+  defines a generator that yields 20% examples from dataset1, 50% examples from
+  dataset2 and 30% examples from dataset3.
+  """
+
+  if counters:
+    assert len(counters) == len(fns)
+  else:
+    counters = [1] * len(fns)
+
+  def parallel_generator(gen=None):
+    # current_counters are increased step by step; they are reset to 0s when
+    # current_counters[idx] == counters[idx] for all idx. See
+    # test_parallel_with_weights_three_datasets for an example of how
+    # current_counters are changed during computation.
+
     generators = []
-    for f in fastmath.tree_flatten(fns):
-      generators.append(f())
+    for f in fns:
+      generators.append(f(gen))
+
+    current_counters = [0]*len(generators)
     while True:
-      for generator in generators:
-        yield next(generator)
+      for idx, generator in enumerate(generators):
+        if current_counters[idx] < counters[idx]:
+          current_counters[idx] += 1
+          # instead of checking current_counters[idx] == counters[idx] for
+          # all idx, we check the equivalent condition:
+          if sum(current_counters) == sum(counters):
+            current_counters = [0]*len(generators)
+          yield next(generator)
   return parallel_generator
 
 
@@ -164,11 +210,95 @@ def Shuffle(queue_size=1024):  # pylint: disable=invalid-name
   return lambda g: shuffle(g, queue_size)
 
 
+data_counters = {}
+
+
+def save_data_counters(output_dir, host_id=None):
+  """Checkpoint data counters."""
+  global data_counters
+  host_id = jax.host_id() if host_id is None else host_id
+  fname = os.path.join(output_dir, 'data_counters%d.pkl' % host_id)
+  with tf.io.gfile.GFile(fname, 'wb') as f:
+    pickle.dump(data_counters, f)
+
+
+def load_data_counters(output_dir, host_id=None):
+  """Checkpoint data counters."""
+  global data_counters
+  host_id = jax.host_id() if host_id is None else host_id
+  fname = os.path.join(output_dir, 'data_counters%d.pkl' % host_id)
+  if not tf.io.gfile.exists(fname):
+    logging.info('Did not load data counters as %s does not exist.', fname)
+    return
+  with tf.io.gfile.GFile(fname, 'rb') as f:
+    obj = pickle.load(f)
+  data_counters = obj
+
+
+def count_and_skip(generator, name):
+  """Count the number of items in the generator, skip already counted ones.
+
+  This function counts the number of processed examples and puts it into
+  the global variable `counters`. This variable can be saved and restored,
+  and if restored, this function will skip examples until the restored counter
+  is reached. When the data generator is deterministic, this allows to restore
+  the data reading process from a checkpoint.
+
+  Args:
+    generator: generator for examples in the dataset.
+    name: string, a unique id that we use to count the examples
+
+  Yields:
+    The examples from generator but first skip the number specified in the
+    global variable counters[name] and next increment this variable every
+    time a new example appears.
+  """
+  global data_counters
+  if name not in data_counters:
+    data_counters[name] = 0
+  local_counter = 0
+  for example in generator:
+    local_counter += 1
+    if local_counter > data_counters[name]:
+      data_counters[name] += 1
+      yield example
+
+
+def CountAndSkip(name):  # pylint: disable=invalid-name
+  """Returns a function that counts and skips examples (see above)."""
+  return lambda g: count_and_skip(g, name)
+
+
+def UniformlySeek(name=None, host_id=None, n_hosts=None, dataset_size=None):  # pylint: disable=invalid-name
+  """Sets each host at (dataset_size/n_hosts)-th of the dataset."""
+  if not dataset_size:
+    dataset_size = 2 ** 18  # 512 * 512
+    logging.error(
+        'No dataset size given to Uniformly seek, assuming: %d', dataset_size)
+  assert name
+  host_id = jax.host_id() if host_id is None else host_id
+  n_hosts = n_hosts or jax.host_count()
+  each_host = int(dataset_size / n_hosts)
+  def _f(generator):
+    # Each host seeks to the appropriate point in the dataset.
+    num_to_seek = int(host_id * each_host)
+    logging.info('Dataset[%s] host_id[%d] is seeking to position[%d]',
+                 name, host_id, num_to_seek)
+    for _ in range(num_to_seek):
+      next(generator)
+    logging.info('Dataset[%s] host_id[%d] reached position[%d]',
+                 name, host_id, num_to_seek)
+    for example in generator:
+      yield example
+  return _f
+
+
 def batch(generator, batch_size):
   """Batch and pad generator as in tf.data.Dataset.padded_batch."""
   if batch_size <= 0:
     raise ValueError(f'Batch size must be positive, but is {batch_size}.')
   buf = []
+  i = 0
   for example in generator:
     buf.append(example)  # Examples are tuples of tensors.
     if len(buf) == batch_size:
@@ -176,6 +306,14 @@ def batch(generator, batch_size):
       # batch is a tuple of arrays: ([in1, in2, in3], [tgt1, tgt2, tgt3])
       batched_example = tuple(np.stack(x) for x in zip(*buf))
       # Note that it's the same shape as each example with added batch dim.
+      i += 1
+      if i & (i - 1) == 0:
+        logging.info('Batch[%d] = %r', i, batched_example)
+        batched_inputs = batched_example[0]
+        for idx, inp in enumerate(batched_inputs):
+          logging.info('Input[%d][%d] = %r', i, idx, inp)
+        for idx, inp in enumerate(batched_inputs):
+          logging.info('Hash[%d][%d] = %r', i, idx, zlib.adler32(bytes(inp)))
       yield batched_example
       buf = []
 
@@ -1080,3 +1218,157 @@ def addition_inputs(
       train_stream=lambda _: batches(train_length, 3),
       eval_stream=lambda _: batches(eval_max_length, eval_min_length)
   )
+
+
+# This is a straightforward translation of T5's random_spans_noise_mask.
+def random_spans_noise_mask(length,
+                            noise_density=0.15,
+                            mean_noise_span_length=3.0,
+                            seed1=None,
+                            seed2=None,
+                            example=None):
+  """Computes span corruption masks given input parameters."""
+  # Passing this in case if we want to use for debugging/logging
+  del example
+  orig_length = length
+  # increase length to avoid degeneracy
+  length = max(length, 2)
+  num_noise_tokens = int(round(length * noise_density))
+  # avoid degeneracy by ensuring positive numbers of noise and nonnoise tokens.
+  num_noise_tokens = min(max(num_noise_tokens, 1), length - 1)
+  num_noise_spans = int(round(num_noise_tokens / mean_noise_span_length))
+  # avoid degeneracy by ensuring positive number of noise spans
+  num_noise_spans = max(num_noise_spans, 1)
+  num_nonnoise_tokens = length - num_noise_tokens
+
+  # Pick the lengths of the noise spans and the non-noise spans
+  def randomly_segment(num_items, num_segments, seed):
+    x = np.arange(num_items - 1) < num_segments - 1
+    # Set random seed if passed (only in tests for now).
+    if seed is not None:
+      np.random.seed(seed)
+    np.random.shuffle(x)
+    first_in_segment = np.pad(x, (1, 0), mode='constant')
+    segment_id = np.cumsum(first_in_segment)
+
+    y = np.roll(segment_id, 1)
+    y[0] = 0
+    idxs = np.pad(np.squeeze(np.argwhere(segment_id - y), axis=1),
+                  (1, 0),
+                  mode='constant')
+    segment_lengths = np.add.reduceat(np.ones_like(segment_id), idxs, axis=0)
+    return segment_lengths
+
+  noise_span_lengths = randomly_segment(
+      num_noise_tokens, num_noise_spans, seed1)
+  nonnoise_span_lengths = randomly_segment(
+      num_nonnoise_tokens, num_noise_spans, seed2)
+  interleaved_span_lengths = np.reshape(
+      np.stack([nonnoise_span_lengths, noise_span_lengths], axis=1),
+      [num_noise_spans * 2])
+  span_starts = np.cumsum(interleaved_span_lengths)[:-1]
+  span_start_indicator = np.zeros(length)  # all 0s to begin with
+  span_start_indicator[span_starts] = 1
+  span_num = np.cumsum(span_start_indicator)
+  is_noise = np.equal(span_num % 2, 1)
+  return is_noise[:orig_length]
+
+
+def generate_sequential_chunks(max_length=None):
+  """Returns a function that generates chunks of atmost max_length length."""
+  def _f(generator):
+    for example in generator:
+      n_tokens = len(example)
+      if n_tokens <= max_length:
+        yield example
+      n_segments = int(math.ceil(float(n_tokens) / float(max_length)))
+      for i in range(n_segments):
+        start = max_length * i
+        end = min(start + max_length, n_tokens)
+        yield example[start:end]
+  return _f
+
+
+def generate_random_noise_mask(noise_density=0.15,
+                               mean_noise_span_length=3.0,
+                               seed1=None,
+                               seed2=None):
+  """Returns a function that generates a random noise mask."""
+  def _f(generator):
+    for example in generator:
+      length = len(example)
+      noise_mask = random_spans_noise_mask(
+          length, noise_density=noise_density,
+          mean_noise_span_length=mean_noise_span_length,
+          seed1=seed1, seed2=seed2, example=example)
+      yield (example, noise_mask)
+  return _f
+
+
+def consume_noise_mask(vocab_size=32100):
+  """Consumes (tokens, noise mask) and returns (inputs, targets)."""
+  def _noise_span_to_unique_sentinel(tokens, noise_mask):
+    prev_token_is_noise = np.pad(
+        noise_mask[:-1], [1, 0], mode='constant', constant_values=False)
+    first_noise_tokens = np.logical_and(noise_mask,
+                                        np.logical_not(prev_token_is_noise))
+    subsequent_noise_tokens = np.logical_and(noise_mask, prev_token_is_noise)
+    sentinel = vocab_size - np.cumsum(first_noise_tokens)
+    tokens = np.where(first_noise_tokens, sentinel, tokens)
+    return tokens[np.logical_not(subsequent_noise_tokens)]
+
+  def _f(generator):
+    for tokens, noise_mask in generator:
+      # Returns inputs and targets.
+      yield (_noise_span_to_unique_sentinel(tokens, noise_mask),
+             _noise_span_to_unique_sentinel(tokens, np.logical_not(noise_mask)))
+  return _f
+
+
+def generate_prefix_lm_sequential_chunks(max_length=None):
+  """Returns a function that generates prefix lm chunks of max_length length."""
+  def _f(generator):
+    for example in generator:
+      n_tokens = len(example)
+      # Don't want extremely short chunks.
+      if n_tokens < 2:
+        continue
+      # The whole document is less than max_length.
+      if n_tokens <= max_length:
+        # Generate a shorter input output pair.
+        half = n_tokens // 2
+        yield (example[:half], example[half:])
+      n_segments = int(math.ceil(float(n_tokens) / float(max_length)))
+      # Go over all but the last segment and make (overlapping) pairs.
+      # So with | showing chunks, the following doc:
+      # | 1 2 3 | 4 5 6 | 7 8
+      # Makes i/o pairs:
+      # (1 2 3, 4 5 6), (4 5 6, 7 8)
+      for i in range(n_segments - 1):
+        start1 = max_length * i
+        start2 = start1 + max_length
+        end2 = min(start2 + max_length, n_tokens)
+        yield (example[start1:start2], example[start2:end2])
+  return _f
+
+
+def MixMLMAndPrefixLM(mlm_rate=4,  # pylint:disable=invalid-name
+                      prefix_lm_rate=1,
+                      noise_density=0.15,
+                      mean_noise_span_length=3.0,
+                      vocab_size=None,
+                      max_length=512):
+  """Parallel between MLM and PrefixLM outputs."""
+  assert vocab_size
+  mlm = Serial(
+      # Generate sequential chunks.
+      generate_sequential_chunks(max_length=max_length),
+      # Generate mask and chunk.
+      generate_random_noise_mask(
+          noise_density=noise_density,
+          mean_noise_span_length=mean_noise_span_length),
+      # Consume mask and chunk to give (input, targets).
+      consume_noise_mask(vocab_size=vocab_size),
+  )
+  prefix_lm = generate_prefix_lm_sequential_chunks(max_length=max_length)
+  return Parallel([mlm, prefix_lm], counters=(mlm_rate, prefix_lm_rate))

@@ -27,10 +27,11 @@ import re
 
 from absl import logging
 import gin
+import jax
 import numpy as np
 import scipy
 import t5.data
-import tensorflow as tf  # pylint: disable=g-explicit-tensorflow-version-import
+import tensorflow as tf
 import tensorflow_datasets as tfds
 import tensorflow_text as tf_text
 from trax import fastmath
@@ -178,7 +179,8 @@ def _train_and_eval_dataset(dataset_name,
                             data_dir,
                             eval_holdout_size,
                             train_shuffle_files=True,
-                            eval_shuffle_files=False):
+                            eval_shuffle_files=False,
+                            subsplit=None):
   """Return train and evaluation datasets, feature info and supervised keys.
 
   Args:
@@ -192,6 +194,8 @@ def _train_and_eval_dataset(dataset_name,
       files at startup. Set to False if you want data determinism.
     eval_shuffle_files: Boolean determining whether or not to shuffle the test
       files at startup. Set to False if you want data determinism.
+    subsplit: a pair of floats (x, y), both in [0, 1], saying which part of the
+      full training dataset we should return (default: all of it, [0, 1]).
 
   Returns:
     a 4-tuple consisting of:
@@ -211,11 +215,19 @@ def _train_and_eval_dataset(dataset_name,
   if tfds.Split.TRAIN not in splits:
     raise ValueError('To train we require a train split in the dataset.')
   train_split = tfds.Split.TRAIN
-  if eval_holdout_size > 0:
-    holdout_percentage = int(eval_holdout_size * 100.0)
-    train_percentage = 100 - holdout_percentage
-    train_split = f'train[:{train_percentage}%]'
-    eval_split = f'train[{train_percentage}%:]'
+  train_examples = info.splits[train_split].num_examples
+  eval_holdout_examples = int(train_examples * eval_holdout_size)
+  if eval_holdout_examples > 0 or subsplit is not None:
+    n_train = train_examples - eval_holdout_examples
+    train_start = int(n_train * subsplit[0])
+    train_end = int(n_train * subsplit[1])
+    if train_end - train_start < 1:
+      raise ValueError('Requested train subsplit has no examples: '
+                       'n_train %d subsplit %s' % (n_train, subsplit))
+    train_split = f'train[{train_start}:{train_end}]'
+
+  if eval_holdout_examples > 0:
+    eval_split = f'train[{eval_holdout_examples}:]'
   elif dataset_name == 'glue/mnli':
     eval_split = 'validation_matched'
     # TODO(kitaev): Support diagnostic dataset (AX)
@@ -248,12 +260,22 @@ def TFDS(  # pylint: disable=invalid-name
     tfds_preprocess_fn=None,
     keys=None,
     train=True,
+    shuffle_train=True,
+    host_id=None,
+    n_hosts=None,
     eval_holdout_size=0):
   """Returns an iterator of numpy arrays representing the dataset."""
   data_dir = download_and_prepare(dataset_name, data_dir)
 
-  (train_data, eval_data, _) = _train_and_eval_dataset(dataset_name, data_dir,
-                                                       eval_holdout_size)
+  host_id = jax.host_id() if host_id is None else host_id
+  n_hosts = n_hosts or jax.host_count()
+  if n_hosts > 1:
+    subsplit = (host_id / n_hosts, (host_id + 1) / n_hosts)
+  else:
+    subsplit = None
+  (train_data, eval_data, _) = _train_and_eval_dataset(
+      dataset_name, data_dir, eval_holdout_size,
+      train_shuffle_files=shuffle_train, subsplit=subsplit)
   dataset = train_data if train else eval_data
   dataset = dataset if tfds_preprocess_fn is None else tfds_preprocess_fn(
       dataset)
@@ -485,7 +507,8 @@ def vocab_size(vocab_type='subword',
   return vocab.vocab_size + n_reserved_ids
 
 
-def _get_vocab(vocab_type='subword', vocab_file=None, vocab_dir=None):
+def _get_vocab(vocab_type='subword', vocab_file=None, vocab_dir=None,
+               extra_ids=0):
   """Gets the vocabulary object for tokenization; see tokenize for details."""
   if vocab_type not in [
       'char', 'subword', 'sentencepiece', 'bert', 'bert-lowercase'
@@ -514,7 +537,7 @@ def _get_vocab(vocab_type='subword', vocab_file=None, vocab_dir=None):
 
   assert vocab_type == 'sentencepiece'
   return t5.data.SentencePieceVocabulary(sentencepiece_model_file=path,
-                                         extra_ids=0)
+                                         extra_ids=extra_ids)
 
 
 # Makes the function accessible in gin configs, even with all args denylisted.
@@ -745,7 +768,31 @@ def bair_robot_pushing_preprocess(dataset, training):
   return dataset
 
 
-DEFAULT_SPM_PATH = 'gs://t5-data/vocabs/cc_all.32000/sentencepiece.model'  # GCS
+def sentencepiece_tokenize(stream, spm_path=None, extra_ids=0):
+  """Sentencepiece tokenization."""
+  spm_path = spm_path or t5.data.DEFAULT_SPM_PATH
+  vocab_file = os.path.basename(spm_path)
+  vocab_dir = os.path.dirname(spm_path)
+  vocab = _get_vocab(vocab_type='sentencepiece',
+                     vocab_file=vocab_file,
+                     vocab_dir=vocab_dir,
+                     extra_ids=extra_ids)
+  for example in stream:
+    # example could either be str or (str,)
+    if isinstance(example, tuple):
+      example = example[0]
+    yield np.array(vocab.encode(example))
+
+
+@gin.configurable()
+def SentencePieceTokenize(  # pylint: disable=invalid-name
+    spm_path=None,
+    extra_ids=0):
+  """Returns a function that maps text to integer arrays."""
+  return lambda g: sentencepiece_tokenize(  # pylint: disable=g-long-lambda
+      g,
+      spm_path=spm_path,
+      extra_ids=extra_ids)
 
 
 @gin.configurable(denylist=['dataset', 'training'])

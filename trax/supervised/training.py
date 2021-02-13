@@ -56,6 +56,7 @@ from trax import jaxboard
 from trax import layers as tl
 from trax import optimizers
 from trax import shapes
+from trax.data import inputs
 from trax.fastmath import numpy as jnp
 from trax.fastmath import random as jax_random
 from trax.supervised import history as trax_history
@@ -196,6 +197,7 @@ class Loop:
     if output_dir is not None:
       self._output_dir = os.path.expanduser(output_dir)
       tf.io.gfile.makedirs(self._output_dir)
+      inputs.load_data_counters(self._output_dir)
     else:
       self._output_dir = None
 
@@ -714,11 +716,12 @@ class Loop:
 
   def save_checkpoint(self, permanent=False):
     """Saves checkpoint to disk for the current training step."""
-    if not self.is_chief:
-      _log('Did not save checkpoint as we are not chief.')
-      return
     if self._output_dir is None:
       _log('Did not save checkpoint as output_dir is None')
+      return
+    inputs.save_data_counters(self._output_dir)
+    if not self.is_chief:
+      _log('Did not save checkpoint as we are not chief.')
       return
     if permanent:
       filename = 'model_{}.pkl.gz'.format(self.step)
@@ -728,10 +731,7 @@ class Loop:
     _log('Saving checkpoint to %s.' % ckpt_file, stdout=False)
     weights = self._model.weights
     state = self._model.state
-    if self._use_memory_efficient_trainer:
-      slots_per_task = [trainer.slots for trainer in self._trainer_per_task]
-    else:
-      slots_per_task = tuple(task.optimizer.slots for task in self._tasks)
+    slots_per_task = [trainer.slots for trainer in self._trainer_per_task]
     # We only need the input signature for the body, not for the loss layers.
     # That part is the same across tasks - take it from the first one.
     input_signature = self._batch_signature[:self._model.n_in]
@@ -854,12 +854,8 @@ class Loop:
             'Can\'t load a single-task checkpoint into a multitask Loop.'
         )
       d['slots_per_task'] = [d['slots']]
-    if self._use_memory_efficient_trainer:
-      for (trainer, slots) in zip(self._trainer_per_task, d['slots_per_task']):
-        trainer.slots = slots
-    else:
-      for (task, slots) in zip(self._tasks, d['slots_per_task']):
-        task.optimizer.slots = slots
+    for (trainer, slots) in zip(self._trainer_per_task, d['slots_per_task']):
+      trainer.slots = slots
     # This is self._model.init_from_file but optimized to not re-read.
     input_signature = d['input_signature']
     weights_and_state_sig = self._model.weights_and_state_signature(

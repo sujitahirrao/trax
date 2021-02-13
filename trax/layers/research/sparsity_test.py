@@ -31,12 +31,12 @@ class EfficientFeedForwardTest(test.TestCase, parameterized.TestCase):
 
   def test_blocksparse_ff_train(self):
     d_model = 1024
-    num_experts = 64
+    n_experts = 64
     d_ff = d_model * 8
     x_shape = (3, 7, d_model)
     with fastmath.use_backend(fastmath.Backend.JAX):
       layer = sparsity.BlockSparseFF(
-          d_ff=d_ff, num_experts=num_experts, temperature=0.7, mode='train')
+          d_ff=d_ff, n_experts=n_experts, temperature=0.7, mode='train')
       x = np.ones(x_shape).astype(np.float32)
       _, _ = layer.init(shapes.signature(x))
       y = layer(x)
@@ -44,7 +44,7 @@ class EfficientFeedForwardTest(test.TestCase, parameterized.TestCase):
 
   def test_blocksparse_ff_predict_equals_eval(self):
     d_model = 1024
-    num_experts = 64
+    n_experts = 64
     d_ff = d_model * 8
     x_shape = (1, 1, d_model)
     temperature = 0.7
@@ -53,7 +53,7 @@ class EfficientFeedForwardTest(test.TestCase, parameterized.TestCase):
       input_signature = shapes.signature(x)
       common_kwargs = dict(
           d_ff=d_ff,
-          num_experts=num_experts,
+          n_experts=n_experts,
           temperature=temperature,
       )
       eval_model = sparsity.BlockSparseFF(
@@ -83,6 +83,7 @@ class EfficientFeedForwardTest(test.TestCase, parameterized.TestCase):
           d_ff=d_ff,
           n_elements_in_block=n_elements_in_block,
           temperature=temperature,
+          multiply_by_controller_output=True,
       )
       eval_model = sparsity.SparseFF(
           mode='eval', **common_kwargs)
@@ -120,6 +121,63 @@ class EfficientFeedForwardTest(test.TestCase, parameterized.TestCase):
       out, _ = model.pure_fn(
           x, weights, state, rng=jax.random.PRNGKey(0))
       self.assertEqual(out.shape, x.shape)
+
+  @parameterized.named_parameters(('_mode_train', 'train'),
+                                  ('_mode_eval', 'eval'),
+                                  ('_mode_predict', 'predict'))
+  def test_sparse_ff_multiply(self, mode):
+    d_model = 8
+    n_elements_in_block = 2
+    d_ff = 16
+    x_shape = (2, 8, d_model)
+    temperature = 0.7
+    with fastmath.use_backend(fastmath.Backend.JAX):
+      x = np.ones(x_shape).astype(np.float32)
+      input_signature = shapes.signature(x)
+      model = sparsity.SparseFF(
+          d_ff=d_ff,
+          n_elements_in_block=n_elements_in_block,
+          temperature=temperature,
+          ff_chunk_size=4,
+          mode=mode,
+          multiply_by_controller_output=True)
+      weights, state = model.init(input_signature)
+      out, _ = model.pure_fn(
+          x, weights, state, rng=jax.random.PRNGKey(0))
+      self.assertEqual(out.shape, x.shape)
+
+  def test_switchsparse_ff_train(self):
+    d_model = 1024
+    n_experts = 64
+    d_ff = d_model * 8
+    x_shape = (3, 7, d_model)
+    layer = sparsity.SwitchSparseFF(
+        d_ff=d_ff, n_experts=n_experts, mode='train')
+    x = np.ones(x_shape).astype(np.float32)
+    layer.init(shapes.signature(x))
+    y = layer(x)
+    self.assertEqual(y.shape, x.shape)
+
+  def test_switchsparse_ff_predict_equals_eval(self):
+    d_model = 1024
+    n_experts = 64
+    d_ff = d_model * 8
+    x_shape = (1, 1, d_model)
+    x = np.ones(x_shape).astype(np.float32)
+    input_signature = shapes.signature(x)
+    eval_model = sparsity.SwitchSparseFF(
+        mode='eval', d_ff=d_ff, n_experts=n_experts)
+    weights, state = eval_model.init(input_signature)
+    eval_out, _ = eval_model.pure_fn(
+        x, weights, state, rng=jax.random.PRNGKey(0))
+    pred_model = sparsity.SwitchSparseFF(
+        mode='predict', d_ff=d_ff, n_experts=n_experts)
+    pred_model.init(input_signature)
+    pred_out, _ = pred_model.pure_fn(
+        x, weights, state, rng=jax.random.PRNGKey(0))
+    self.assertEqual(eval_out.shape, x.shape)
+    # eval_out and pred_out should be identical.
+    np.testing.assert_array_almost_equal(eval_out[0, 0, :], pred_out[0, 0, :])
 
 
 class ReversibleReshapePermuteTest(test.TestCase):
@@ -250,6 +308,39 @@ class MultiplicativeModularCausalAttentionTest(test.TestCase):
 
     y = layer(x)
     self.assertEqual(y.shape, (1, 3, 4))
+
+
+class MultiplicativeConvCausalAttentionTest(test.TestCase):
+
+  def test_simple_call(self):
+    layer = sparsity.MultiplicativeConvCausalAttention(
+        d_feature=4, n_heads=2, sparsity=2)
+    x = np.array([[[2, 5, 3, 4],
+                   [0, 1, 2, 3],
+                   [0, 1, 2, 3],]])
+    _, _ = layer.init(shapes.signature(x))
+
+    y = layer(x)
+    self.assertEqual(y.shape, (1, 3, 4))
+
+  def test_various_calls(self):
+    list_kwargs = []
+    for share_qk in [True, False]:
+      for output in ['none', 'mult', 'conv', 'multconv']:
+        for concat in ['original', 'fixed', 'none']:
+          kwargs = {'share_qk': share_qk, 'output_layer_type': output,
+                    'v_concat_type': concat}
+          list_kwargs.append(kwargs)
+    for kwargs in list_kwargs:
+      layer = sparsity.MultiplicativeConvCausalAttention(
+          d_feature=4, n_heads=2, sparsity=2, **kwargs)
+      x = np.array([[[2, 5, 3, 4],
+                     [0, 1, 2, 3],
+                     [0, 1, 2, 3],]])
+      _, _ = layer.init(shapes.signature(x))
+
+      y = layer(x)
+      self.assertEqual(y.shape, (1, 3, 4))
 
 
 class FavorTest(test.TestCase):
