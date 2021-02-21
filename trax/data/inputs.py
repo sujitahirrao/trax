@@ -69,6 +69,7 @@ lines from `my_file.txt` as follows::
 """
 
 import math
+import multiprocessing.dummy as mp  # using threads for now
 import os
 import pickle
 import random
@@ -135,7 +136,12 @@ def Parallel(fns=None, counters=None):  # pylint: disable=invalid-name
 
     generators = []
     for f in fns:
-      generators.append(f(gen))
+      if gen:
+        generators.append(f(gen))
+      else:
+        # This handles the case when the function f cannot be
+        # called on None.
+        generators.append(f())
 
     current_counters = [0]*len(generators)
     while True:
@@ -164,6 +170,26 @@ def Log(n_steps_per_example=1, only_shapes=True):  # pylint: disable=invalid-nam
       counter += 1
       yield example
   return log
+
+
+def _generator_process(generator, in_q, out_q):
+  for example in generator:
+    in_q.get()
+    out_q.put(example)
+
+
+def Prefetch(n_prefetch=2):  # pylint: disable=invalid-name
+  """Pre-fetches a number of examples from generator in a separate process."""
+  def prefetch(generator):
+    in_q, out_q = mp.Queue(), mp.Queue()
+    p = mp.Process(target=_generator_process, args=(generator, in_q, out_q))
+    for _ in range(n_prefetch):
+      in_q.put(None)
+    p.start()
+    while True:
+      yield out_q.get()
+      in_q.put(None)
+  return prefetch
 
 
 def shuffle(samples, queue_size):
@@ -930,9 +956,9 @@ def make_additional_stream(stream=gin.REQUIRED):
 
 
 @gin.configurable()
-def make_parallel_stream(streams=gin.REQUIRED):
+def make_parallel_stream(streams=gin.REQUIRED, counters=None):
   """Create a parallel stream for use in gin configs for additional tasks."""
-  return Parallel(streams)()
+  return Parallel(streams, counters=counters)()
 
 
 @gin.configurable()
@@ -1381,5 +1407,9 @@ def MixMLMAndPrefixLM(mlm_rate=4,  # pylint:disable=invalid-name
       # Consume mask and chunk to give (input, targets).
       consume_noise_mask(vocab_size=vocab_size),
   )
+  if mlm_rate > 0 and prefix_lm_rate == 0:
+    return mlm
   prefix_lm = generate_prefix_lm_sequential_chunks(max_length=max_length - 1)
+  if prefix_lm_rate > 0 and mlm_rate == 0:
+    return prefix_lm
   return Parallel([mlm, prefix_lm], counters=(mlm_rate, prefix_lm_rate))

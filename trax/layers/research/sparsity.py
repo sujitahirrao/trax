@@ -395,9 +395,8 @@ def SparseDenseWithOptions(n_units, d_input=None, sparsity_type=None,
   if sparsity_type is None or sparsity_type == 'None' or sparsity == 0:
     return tl.Dense(n_units, use_bias=use_bias, use_bfloat16=use_bfloat16)
   if sparsity_type == 'mult':
-    return MultiplicativeSparseDense(
-        sparsity, d_input, n_units, use_bias=use_bias,
-        use_bfloat16=use_bfloat16)
+    return FactoredDense(sparsity, d_input, n_units, use_bias=use_bias,
+                         use_bfloat16=use_bfloat16)
 
   assert not use_bfloat16  # use_bfloat16 is unsupported for other variants
   if sparsity_type == 'lowrank':
@@ -446,51 +445,74 @@ def LowRankCausalAttention(d_feature, n_heads=1, dropout=0.0,
 
 
 @assert_shape('...a->...b')
-def MultiplicativeSparseDense(sparsity, d_input, d_output=None,
-                              use_bias=True, use_bfloat16=False):
-  """Returns a replacement of Dense layer which uses less parameters.
+def FactoredDense(n_modules, d_in, d_out, use_bias=True, use_bfloat16=False):
+  r"""Returns a Dense-like layer, internally factored to use fewer parameters.
 
-  The layer uses number of modules equal to `sparsity`. It multiplies each
-  dimension of the input tensor by a scalar specific to each dimension and each
-  module separately; then it applies Dense(d_output/sparsity) to each module.
-  Compared to standard dense layer, MultiplicativeSparseDense uses less
-  parameters while still being able to express many interesting functions (for
-  example a permutation).
+  This layer treats an activation vector as if divided into :math:`M`
+  subvectors (``n_modules`` 'modules'). It uses this factored view to compute
+  a :py:class:`Dense`-like mapping with high mixing/connectivity, but using
+  approximately :math:`1/M` the number of weights of a similarly dimensioned
+  :py:class:`Dense` layer.
+
+  More specifically, each activation vector of dimensionality ``n_in`` is
+  multiplied element-wise (a generalized form of gating) with ``n_modules``
+  vectors also of dimensionality ``n_in``. The resulting vectors are projected
+  to the subvector/module dimensionality ``d_out / n_modules`` via a matrix
+  multiply, and finally reshaped back to a single vector of dimensionality
+  ``d_out``. Optionally, a bias vector of dimensionality ``d_out`` is added at
+  the end. All the above-mentioned non-input objects -- gating vectors,
+  projection matrix, and optional bias -- are trainable weights.
 
   Args:
-    sparsity: The sparsity of the layer; the output vector is divided into this
-        number of modules.
-    d_input: Dimensionality of input tensor.
-    d_output: Dimensionality of output tensor; by default equal to d_input.
-    use_bias: Whether to use bias.
-    use_bfloat16: Whether to use bfloat16 for weights.
+    n_modules: Number by which an activation vector is divided into subvectors
+        (modules) for the factored computation.
+    d_in: Last/innermost dimension of input array.
+    d_out: Last/innermost dimension of output array.
+    use_bias: If True, add bias vectors at the end of the layer; else end the
+        layer with the matrix multiply.
+    use_bfloat16: If True, use bfloat16 weights; else use float32 weights.
   """
+  if d_out % n_modules != 0:
+    raise ValueError(f'Value d_out ({d_out}) must be a multiple of arg '
+                     f'n_modules ({n_modules}).')
+  d_module = d_out // n_modules
 
-  assert d_output % sparsity == 0
-  d_module = d_output // sparsity
+  def GatingVectors():
+    return tl.Weights(init.RandomNormalInitializer(stddev=0.5),
+                      shape=[n_modules, d_in],
+                      use_bfloat16=use_bfloat16)
+
+  def ProjectionMatrix():
+    return tl.Weights(init.GlorotUniformInitializer(),
+                      shape=[d_in, d_module],
+                      use_bfloat16=use_bfloat16),
+
+  def Bias():
+    return tl.Weights(init.RandomNormalInitializer(1e-6),
+                      shape=[d_out],
+                      use_bfloat16=use_bfloat16),
 
   layers = [
-      # Weight below is used for per-head preprocessing of an embedding.
-      tl.Weights(init.RandomNormalInitializer(stddev=0.5),
-                 shape=[sparsity, d_input], use_bfloat16=use_bfloat16),
-      # Weight below is dense kernel, shared across heads.
-      tl.Weights(init.GlorotUniformInitializer(), [d_input, d_module],
-                 use_bfloat16=use_bfloat16),
-      # To save memory the per-head preprocessing and multiplying by the
-      # kernel is done in the same einsum.
-      tl.Fn('AttentionEinsum',
-            (lambda kernel, multiplier, embeds:  # pylint: disable=g-long-lambda
-             jnp.einsum('dx,hd,...d->...hx', kernel, multiplier, embeds))),
+      GatingVectors(),
+      ProjectionMatrix(),
+      _GateAndProject(),
       MergeLastTwoAxes(),
   ]
   if use_bias:
-    layers.extend([
-        # Weight below is bias after dense, per-head.
-        tl.Weights(init.RandomNormalInitializer(1e-6), [d_output],
-                   use_bfloat16=use_bfloat16),
-        tl.Add(),
-    ])
+    layers += [Bias(), tl.Add()]
+
   return tl.Serial(layers)
+
+
+def _GateAndProject():
+  """Returns a combined gating+projection layer that saves on memory."""
+
+  def f(projection, gating, x):
+    # Args arrive in reverse order because of how they were put on the stack.
+    # Einsum indices: d (d_in), n (n_modules), m (d_module = d_out/n_modules)
+    return jnp.einsum('...d,nd,dm->...nm', x, gating, projection)
+
+  return tl.Fn('_GateAndProject', f)
 
 
 @assert_shape('...a->...a')
@@ -557,10 +579,10 @@ def MultiplicativeCausalAttention(d_feature, n_heads=1, sparsity=None,
   """
   sparsity = n_heads if sparsity is None else sparsity
   return tl.ConfigurableAttention(
-      MultiplicativeSparseDense(sparsity, d_feature, d_feature),
-      MultiplicativeSparseDense(sparsity, d_feature, d_feature),
-      MultiplicativeSparseDense(sparsity, d_feature, d_feature),
-      MultiplicativeSparseDense(sparsity, d_feature, d_feature),
+      FactoredDense(sparsity, d_feature, d_feature),
+      FactoredDense(sparsity, d_feature, d_feature),
+      FactoredDense(sparsity, d_feature, d_feature),
+      FactoredDense(sparsity, d_feature, d_feature),
       n_heads=n_heads, qkv_attention_layer=tl.DotProductCausalAttention(
           dropout=dropout, max_inference_length=max_inference_length,
           mode=mode))
@@ -575,7 +597,7 @@ def MultiplicativeModularCausalAttention(
   Like `CausalAttention`, this layer type represents one pass of multi-head
   self-attention with causal masking rather than padding-based masking. However,
   for computing Q/K/V instead of a Dense layer it combines
-  MultiplicativeSparseDense layer with LocallyConnectedLayer.
+  FactoredDense layer with LocallyConnectedLayer.
 
   Args:
     d_feature: Depth/dimensionality of feature embedding.
@@ -607,7 +629,7 @@ def MultiplicativeConvCausalAttention(
   Like `CausalAttention`, this layer type represents one pass of multi-head
   self-attention with causal masking rather than padding-based masking. However,
   for computing Q/K/V instead of a Dense layer it combines
-  MultiplicativeSparseDense layer with LocallyConvLayer.
+  FactoredDense layer with LocallyConvLayer.
 
   Args:
     d_feature: Depth/dimensionality of feature embedding.
@@ -641,7 +663,7 @@ def MultiplicativeConvCausalAttention(
 
   output_layers = []
   if 'mult' in output_layer_type:
-    output_layers.append(MultiplicativeSparseDense(
+    output_layers.append(FactoredDense(
         sparsity, d_feature, d_feature))
   if 'conv' in output_layer_type:
     output_layers.append(LocallyConvDense(
@@ -677,7 +699,7 @@ def MultiplicativeConvCausalAttention(
   if share_qk:
     return tl.Serial(
         tl.Select([0, 0]),  # pre-qkv, pre-v-for-concat
-        MultiplicativeSparseDense(sparsity, d_feature, d_feature),  # shared q k
+        FactoredDense(sparsity, d_feature, d_feature),  # shared q k
         tl.Select([0, 0]),  # pre-qk, pre-v, pre-v-for-concat
         LocallyConvDense(sparsity, d_module, mode=mode, kernel_size=3,
                          length_kernel_size=length_kernel_size),
@@ -699,7 +721,7 @@ def MultiplicativeConvCausalAttention(
     )
   return tl.Serial(
       tl.Select([0, 0]),  # duplicate activations
-      MultiplicativeSparseDense(sparsity, d_feature, d_feature),  # shared q, k
+      FactoredDense(sparsity, d_feature, d_feature),  # shared q, k
       tl.Select([0, 0, 0]),  # use for q, k, v
       tl.Parallel(
           [LocallyConvDense(sparsity, d_module, mode=mode, kernel_size=3,
@@ -1009,11 +1031,9 @@ class _SparseFFController(base.Layer):
     x = jnp.reshape(x, [-1, x_shape[-1]])  # Easier to operate on flattened x.
 
     # Q: should we add bias and/or put relu after the low-rank m1 dot?
-    # TODO(jaszczur): replacing multiplication and reshape by this einsum may
-    # bring training speed improvement (see also reshape in initialization).
-    # mask_logits = jnp.einsum('bd,dl,lxy->bxy', x, m1, m2) + mb
-    mask_logits = jnp.dot(jnp.dot(x, m1), m2) + mb
-    mask_logits = jnp.reshape(mask_logits, [-1, self._d1, self._d2])
+    # Replacing multiplication and reshape by this einsum brings training speed
+    # improvement (see also reshape in initialization).
+    mask_logits = jnp.einsum('bd,dl,lxy->bxy', x, m1, m2) + mb
 
     if self._also_return_nondiscrete_output:
       # Softmax.
@@ -1059,9 +1079,9 @@ class _SparseFFController(base.Layer):
       m2 = m2.astype(jnp.bfloat16)
       mb = mb.astype(jnp.bfloat16)
 
-    # Reshapes below, with einsum in feedforward, should improve training speed.
-    # m2 = jnp.reshape(m2, [self._d_lowrank, self._d1, self._d2])
-    # mb = jnp.reshape(mb, [self._d1, self._d2])
+    # Reshapes below, with einsum in feedforward, improve the training speed.
+    m2 = jnp.reshape(m2, [self._d_lowrank, self._d1, self._d2])
+    mb = jnp.reshape(mb, [self._d1, self._d2])
 
     self.weights = (m1, m2, mb)
 
@@ -1259,7 +1279,12 @@ def SparseFF(
           kernel_initializer=kernel_initializer,
           bias_initializer=bias_initializer,
           multiply_by_controller_output=multiply_by_controller_output),
+      # quant_mask, emb
+      tl.Select([1, 0]),
+      # emb, quant_mask
       tl.Dropout(rate=dropout_rate, shared_axes=dropout_shared_axes, mode=mode),
+      tl.Select([1, 0]),
+      # quant_mask, emb
   ]
 
   # We will "remember" quant_mask _after_ chunking, and "recall" this same

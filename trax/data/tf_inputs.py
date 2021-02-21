@@ -206,15 +206,16 @@ def _train_and_eval_dataset(dataset_name,
      * supervised_keys: information what's the input and what's the target,
          ie., a pair of lists with input and target feature names.
   """
+  logging.info('Building TF data pipeline for %s', dataset_name)
   if dataset_name.startswith('t2t_'):
     return _train_and_eval_dataset_v1(dataset_name[4:], data_dir,
                                       train_shuffle_files, eval_shuffle_files)
   dataset_builder = tfds.builder(dataset_name, data_dir=data_dir)
   info = dataset_builder.info
   splits = dataset_builder.info.splits
-  if tfds.Split.TRAIN not in splits:
+  if dataset_name != 'c4/multilingual' and tfds.Split.TRAIN not in splits:
     raise ValueError('To train we require a train split in the dataset.')
-  train_split = tfds.Split.TRAIN
+  train_split = tfds.Split.TRAIN if dataset_name != 'c4/multilingual' else 'en'
   train_examples = info.splits[train_split].num_examples
   eval_holdout_examples = int(train_examples * eval_holdout_size)
   if eval_holdout_examples > 0 or subsplit is not None:
@@ -224,13 +225,14 @@ def _train_and_eval_dataset(dataset_name,
     if train_end - train_start < 1:
       raise ValueError('Requested train subsplit has no examples: '
                        'n_train %d subsplit %s' % (n_train, subsplit))
-    train_split = f'train[{train_start}:{train_end}]'
+    train_split = f'{train_split}[{train_start}:{train_end}]'
 
   if eval_holdout_examples > 0:
-    eval_split = f'train[{eval_holdout_examples}:]'
+    eval_split = f'{train_split}[{eval_holdout_examples}:]'
   elif dataset_name == 'glue/mnli':
     eval_split = 'validation_matched'
-    # TODO(kitaev): Support diagnostic dataset (AX)
+  elif dataset_name == 'c4/multilingual':
+    eval_split = 'en-validation'
   else:
     if tfds.Split.VALIDATION not in splits and 'test' not in splits:
       raise ValueError('We require a validation or test split in the dataset.')
@@ -1420,6 +1422,7 @@ def CreateT5GlueInputs(  # pylint: disable=invalid-name
       copy_pretokenized=True,
       debug_print_examples=True,
       debug_print_examples_rate=0.05)
+  proc_dataset = tfds.as_numpy(proc_dataset)
 
   def t5_yield_examples(generator=None):
     del generator
@@ -1981,14 +1984,15 @@ def CreateDropInputs(  # pylint: disable=invalid-name
     dataset = tfds.load(name='drop', split='train')
   else:
     dataset = tfds.load(name='drop', split='dev')
+  dataset = tfds.as_numpy(dataset)
 
   def drop_yield_examples(generator=None):
     del generator
     while True:
       for example in itertools.cycle(dataset):
-        input_values = 'drop question: ' + example['passage'].numpy().decode(
-            'utf-8') + ' ' + example['question'].numpy().decode('utf-8')
-        target_values = str(example['answer'].numpy().decode('utf-8'))
+        input_values = 'drop question: ' + example['passage'].decode(
+            'utf-8') + ' ' + example['question'].decode('utf-8')
+        target_values = example['answer'].decode('utf-8')
         # Apparently the dataset has some empty "target values" -
         # when such a value is encountered, the Tokenizer decides to assign
         # to it a float32 tensor and the training fails.
@@ -2007,6 +2011,7 @@ def CreateDropInputs(  # pylint: disable=invalid-name
 def CreateAnnotatedDropInputs(  # pylint: disable=invalid-name
     dataset_path=None,
     train=True,
+    single_file=True,
     percentile=1.):
   r"""Prepares annotated Drop inputs.
 
@@ -2055,6 +2060,9 @@ def CreateAnnotatedDropInputs(  # pylint: disable=invalid-name
     dataset_path: a path with the Aqua dataset.
     train: if True, then generate training examples, otherwhise generate
       validation examples (the dataset has also a test set).
+    single_file: if True, then look just for one file. If False, read all
+      json files in a given directory and assume that each file contains one
+      example. Applied only to training data.
     percentile: the percentile of the train dataset used for training; default
       set to 1., though setting to a lower value can be interesting when
       combined train is combined with another source of data.
@@ -2065,23 +2073,57 @@ def CreateAnnotatedDropInputs(  # pylint: disable=invalid-name
     using for example the tokenize function from this module.
   """
   if train:
-    dataset_path = os.path.join(dataset_path, 'train_annotated.json')
+    if single_file:
+      dataset_path = os.path.join(dataset_path, 'train_annotated.json')
   else:
     dataset_path = os.path.join(dataset_path, 'dev_annotated.json')
-  # Opening with GFile allows to use remotely stored files, e.g.
-  # in a gs bucket.
-  dataset_handle = tf.io.gfile.GFile(dataset_path, 'r')
-  dataset = []
-  for line in dataset_handle:
-    dataset.append(json.loads(line))
-  dataset = dataset[:int(len(dataset) * percentile)]
+
+  def load_dataset():
+    dataset = []
+    if single_file:
+      # Opening with GFile allows to use remotely stored files, e.g.
+      # in a gs bucket.
+      dataset_handle = tf.io.gfile.GFile(dataset_path, 'r')
+      for line in dataset_handle:
+        dataset.append(json.loads(line))
+    else:
+      all_files = tf.io.gfile.listdir(dataset_path)
+      for filename in all_files:
+        if 'json' in filename:
+          print('Loading data from file {}'.format(filename))
+          with tf.io.gfile.GFile(os.path.join(dataset_path, filename)) as f:
+            for line in f:
+              dataset.append(json.loads(line))
+            # dataset.append(json.load(f))
+    print('The total size of the dataset {}'.format(len(dataset)))
+    return dataset[:int(len(dataset) * percentile)]
 
   def drop_annotated_yield_examples(generator=None):
     del generator
     while True:
-      for example in itertools.cycle(dataset):
-        input_values = 'drop annotated question: ' + example[
-            'passage'] + ' ' + example['question']
+      # Notice that below we enable a poor man RL loop
+      # aka the DAgger algorithm: https://arxiv.org/pdf/1011.0686.pdf
+      # tl;dr: after parsing all examples we re-load the dataset - this
+      # may become handy if a prediction service generates new examples.
+      dataset = load_dataset()
+      for example in dataset:
+        # Do we have a pre-calculated input in the example?
+        if 'input' in example.keys():
+          question = example['input']
+          # Remove the old prompt
+          question = question[question.find(':') + 2:]
+        else:
+          # If input is not present, then we expect that this is an
+          # original drop example.
+          question = example['passage'] + ' ' + example['question']
+          list_num = [
+              float(num.replace(',', '').rstrip('.')) for num in re.findall(
+                  r'[-+]?[.]?[\d]+(?:,\d\d\d)*[\.]?\d*(?:[eE][-+]?\d+)?',
+                  question)
+          ]
+          for i in range(len(list_num)):
+            question += ' n{} = {}'.format(i, list_num[i])
+        input_values = 'drop annotated question: ' + question
         target_values = example['calculation']
         yield input_values, target_values, np.array(
             [1] * len(target_values), dtype=np.int32)
