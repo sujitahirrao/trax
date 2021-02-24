@@ -234,7 +234,6 @@ class Loop:
     # NOTE: Averaging the weights across devices can screw up the initial weight
     # statistics.
     # TODO(pkozakowski): Broadcast from one of the devices instead?
-    # TODO(lukaszkaiser): make it work for the memory-efficient trainer too.
     if (random_seed is None and self._n_hosts > 1 and
         not use_memory_efficient_trainer):
       logging.info('Syncing weights/state across %d hosts.', self._n_hosts)
@@ -242,6 +241,19 @@ class Loop:
 
     # Create the optimizer for the training loss function.
     self._trainer_per_task = tuple(self._init_trainer(task) for task in tasks)
+
+    # Sync layers weights/state in memory effcient trainer layers.
+    if (random_seed is None and self._n_hosts > 1 and
+        use_memory_efficient_trainer):
+      logging.info('Syncing layers across %d hosts.', self._n_hosts)
+      for layer in self._trainer_per_task[0].all_layers:
+        weights_and_state = (layer.weights, layer.state)
+        if not _is_empty(weights_and_state):
+          layer.weights, layer.state = tl.on_cpu(self._unreplicate(
+              _make_weights_and_state_same_across_hosts(
+                  self._for_n_devices(weights_and_state))))
+
+    # Load checkpoint if it exists.
     self.load_checkpoint()
 
     # Prepare eval components.
@@ -744,12 +756,9 @@ class Loop:
     flat_weights, flat_state = tl.flatten_weights_and_state(weights, state)
     _, flat_eval_state = tl.flatten_weights_and_state(
         weights, self._eval_model.state)
-    if self._use_memory_efficient_trainer:
-      sharded_weights_len = self._save_weights_sharded(flat_weights, ckpt_file)
-      # In the main dict we just save the number of shards in place of weights.
-      weights_in_dict = sharded_weights_len
-    else:
-      weights_in_dict = self._to_bits(flat_weights)
+    tl.np_to_file(self._to_bits(flat_weights), ckpt_file + '.npy',
+                  compresslevel=0 if self._use_memory_efficient_trainer else 2)
+    weights_in_dict = 0 if self._use_memory_efficient_trainer else 2
     d = {
         'step': self.step,
         'flat_weights': weights_in_dict,
@@ -761,34 +770,7 @@ class Loop:
         'version_timestamp': 'Oct-28-2020'  # To update in the future if needed.
     }
     pickle_to_file(d, ckpt_file, gzip=True)
-    # Move sharded files to non-tmp files after all is saved.
-    if self._use_memory_efficient_trainer:
-      for i in range(weights_in_dict):
-        fname = ckpt_file + '.shard%d' % i
-        tf.io.gfile.rename(fname + '.tmp', fname, overwrite=True)
     _log('Checkpoint saved in %s.' % ckpt_file, stdout=False)
-
-  def _save_weights_sharded(self, flat_weights, ckpt_file):
-    """Saves flat_weights in a sharded way to ckpt_file.shardN.tmp."""
-    # In large models, we shard weights into multiple files.
-    # Otherwise using pickle can lead to running out of RAM.
-    # We shard weights into parts of over 4M floats to avoid tiny files.
-    max_shard_size = 4 * 1024 * 1024
-    sharded_weights, current_shard, current_shard_size = [], [], 0
-    for w in flat_weights:
-      current_shard.append(w)
-      current_shard_size += int(np.prod(w.shape))
-      if current_shard_size > max_shard_size:
-        sharded_weights.append(current_shard)
-        current_shard, current_shard_size = [], 0
-    if current_shard:  # Append the last shard if it's not empty.
-      sharded_weights.append(current_shard)
-    # Save weight shards to files (tmp first to be resilient to failure).
-    for i, w in enumerate(sharded_weights):
-      path = ckpt_file + '.shard%d.tmp' % i
-      _log('Saving sharded weights to %s.' % path, stdout=False)
-      pickle_to_file(self._to_bits(w), path, gzip=False)
-    return len(sharded_weights)
 
   def _to_bits(self, weights):
     """Converts a list of weights to bit-cast weights and their types."""
@@ -800,25 +782,24 @@ class Loop:
     bits = []
     for w in weights:
       if w.dtype == jnp.bfloat16:
-        bits.append((jax.lax.bitcast_convert_type(w, np.uint16), 'bfloat16'))
+        converted = jax.lax.bitcast_convert_type(w, np.uint16)
+        bits.append(converted.astype(np.uint16))
       else:  # for non-bfloat16 weights, be compatible with earlier checkpoints
         bits.append(w)
     return bits
 
-  def _from_bits(self, bits_and_types):
-    """Converts a list of bit-cast weights and their types back to weights."""
+  def _from_bits(self, bits):
+    """Converts a list of bit-cast weights back to weights."""
     # This is the reverse of _to_bits, see above for explanation.
     if not fastmath.is_backend(fastmath.Backend.JAX):
-      return bits_and_types
+      return bits
     weights = []
-    for bits_and_dtype in bits_and_types:
-      if isinstance(bits_and_dtype, tuple):
-        bits, dtype = bits_and_dtype
-        assert dtype == 'bfloat16'
-        w = jax.lax.bitcast_convert_type(bits, jnp.bfloat16)
-        weights.append(w)
+    for b in bits:
+      if b.dtype == np.uint16:  # currently all uint16 are bfloat16s
+        w = jax.lax.bitcast_convert_type(b, jnp.bfloat16)
+        weights.append(np.asarray(w))
       else:
-        weights.append(bits_and_dtype)
+        weights.append(b)
     return weights
 
   def load_checkpoint(self, directory=None, filename=None):
@@ -841,15 +822,12 @@ class Loop:
       return
     _log('Loading checkpoint from %s.' % path, stdout=False)
     d = unpickle_from_file(path, gzip=True)
-    # For large models, load weights from sharded files.
-    if self._use_memory_efficient_trainer:
-      weights = []
-      n_shards = d['flat_weights']  # We store the number of shards in d here.
-      for i in range(n_shards):
-        w = unpickle_from_file(path + '.shard%d' % i, gzip=False)
-        w = self._from_bits(w)  # bit-casting may put w on accelerator, go back
-        weights.extend([tl.on_cpu(x) for x in w])
-      d['flat_weights'] = weights
+    # Weights are stored in a separate non-pickled file in the new checkpoint
+    # format. We support loading old checkpoints with this hack.
+    # TODO(lukaszkaiser): remove the hack when not needed any more.
+    if isinstance(d['flat_weights'], int):
+      weights = tl.np_from_file(path + '.npy', compresslevel=d['flat_weights'])
+      d['flat_weights'] = self._from_bits(weights)
     else:
       d['flat_weights'] = self._from_bits(d['flat_weights'])
     self._step = d['step']
@@ -861,22 +839,31 @@ class Loop:
         )
       d['slots_per_task'] = [d['slots']]
     for (trainer, slots) in zip(self._trainer_per_task, d['slots_per_task']):
-      trainer.slots = slots
+      matched_flat_slots = _match_by_shape(fastmath.tree_flatten(trainer.slots),
+                                           fastmath.tree_flatten(slots))
+      matched_slots, _ = fastmath.tree_unflatten(
+          matched_flat_slots, trainer.slots, copy_from_tree=[()])
+      trainer.slots = matched_slots
     # This is self._model.init_from_file but optimized to not re-read.
     input_signature = d['input_signature']
     weights_and_state_sig = self._model.weights_and_state_signature(
         input_signature)
+    flat_init_weights, flat_init_state = tl.flatten_weights_and_state(
+        self._model.weights, self._model.state)
+    if len(d['flat_weights']) < len(flat_init_weights):
+      _log('Checkpoint has less weights than the model, loading first ones.')
+    matched_weights = _match_by_shape(flat_init_weights, d['flat_weights'])
     try:
       restored_state = True
+      matched_state = _match_by_shape(flat_init_state, d['flat_state'])
       weights, state = tl.unflatten_weights_and_state(
-          d['flat_weights'], d['flat_state'], weights_and_state_sig)
+          matched_weights, matched_state, weights_and_state_sig)
       self._model.state = state
     except IndexError:
-      _log('Failed restoring model state from checkpoint, trying weights only.')
+      _log('Failed loading model state from checkpoint, loading weights only.')
       restored_state = False
       weights, _ = tl.unflatten_weights_and_state(
-          d['flat_weights'], d['flat_state'], weights_and_state_sig,
-          weights_only=True)
+          matched_weights, (), weights_and_state_sig, weights_only=True)
     self._model.weights = weights
     self._eval_model.weights = self._model.weights
     # Restore eval model state; note: it's not always the same as train state.
@@ -886,7 +873,7 @@ class Loop:
       else:  # It wasn't saved in old checkpoints; remove this branch once done.
         flat_eval_state = d['flat_state']
       _, eval_state = tl.unflatten_weights_and_state(
-          d['flat_weights'], flat_eval_state, weights_and_state_sig)
+          matched_weights, flat_eval_state, weights_and_state_sig)
       self._eval_model.state = eval_state
     _log('Checkpoint loaded from %s.' % path, stdout=False)
 
@@ -1217,32 +1204,57 @@ def _accelerate_model_with_metrics(model_with_metrics, n_devices,
 def _make_weights_and_state_same_across_hosts(weights_and_state):
   """Makes train and eval model's weights and state the same across hosts."""
 
-  # We assume that they have been already replicated, i.e the leading axis is
-  # self._n_devices
+  # We assume that weights_and_state have been already replicated, i.e the
+  # leading axis is self._n_devices
 
   # This is the total number of devices across all hosts.
   n_devices_total = fastmath.psum(jnp.array(1.0), 'devices').astype(jnp.int32)
 
-  # This sums up the weights and state across all devices.
-  # NOTE: There will not be any leading axis remaining because we psum
-  # over it.
-  weights_and_state = fastmath.psum(weights_and_state, 'devices')
-
-  # We finally take the average over all devices.
+  # We average the weights and state across all devices.
   # We also make sure we don't change the type of the weights and state.
-  weights_and_state = jax.tree_util.tree_map(
-      lambda ws: (ws / n_devices_total).astype(ws.dtype), weights_and_state)
+  return fastmath.nested_map(
+      lambda x: (fastmath.psum(x, 'devices') / n_devices_total).astype(x.dtype),
+      weights_and_state)
 
-  return weights_and_state
+
+def _is_empty(x):
+  if isinstance(x, (list, tuple)):
+    return all(_is_empty(y) for y in x)
+  else:
+    return x is None
 
 
 def _is_uninitialized(model):
   """Checks whether no weights in the model have been initialized."""
-  def _is_empty(x):
-    if isinstance(x, (list, tuple)):
-      return all(_is_empty(y) for y in x)
-    else:
-      return x is None
   if not _is_empty(model.weights):
     return False
   return all(_is_uninitialized(l) for l in model.sublayers)
+
+
+def _match_by_shape(full, partial):
+  """Puts partial into full matching by shape."""
+  partial_idx = 0
+  res = []
+  for w in full:
+    if partial_idx >= len(partial):
+      res.append(w)  # read everything from parial list, just fill
+    elif w is None and partial[partial_idx] is None:  # both Nones, move on
+      res.append(None)
+      partial_idx += 1
+    elif w is None or partial[partial_idx] is None:  # one None but not both
+      res.append(w)
+    elif w.shape == partial[partial_idx].shape:
+      res.append(partial[partial_idx])
+      partial_idx += 1
+    else:
+      res.append(w)
+  if partial_idx < len(partial):
+    _log('Did not manage to match shapes in model for all checkpoint weights.')
+    for w in partial[:partial_idx]:
+      _log('  Inserted tensor of shape %s' % str(w.shape))
+    for i, w in enumerate(partial[partial_idx:]):
+      _log('  Not inserted tensor of shape %s' % str(w.shape))
+      model_weight_shape = str(full[i + partial_idx].shape)
+      _log('  Tensor in that place has shape: %s' % model_weight_shape)
+    raise IndexError
+  return res
