@@ -177,7 +177,7 @@ def HardTanh():
 
   .. math::
       f(x) = \left\{ \begin{array}{cl}
-          -1 & \text{if}\ x \leq 0, \\
+          -1 & \text{if}\ x \leq -1, \\
           x  & \text{if}\ -1 < x < 1, \\
           1  & \text{otherwise}.
       \end{array} \right.
@@ -215,6 +215,25 @@ def Swish():
       f(x) = x \cdot \text{sigmoid}(x)
   """
   return Fn('Swish', lambda x: x * fastmath.expit(x))
+
+
+@assert_shape('...a->...b')  # The output and input shapes are not the same.
+def Glu():
+  r"""Returns a layer that computes the Gated Linear Unit function.
+
+  .. math::
+      f(x) = a \cdot \text{sigmoid}(b)
+  where a and b are formed by splitting input in half along axis
+
+  """
+
+  def _f(x, axis=-1):  # pylint: disable=invalid-name
+    size = x.shape[axis]
+    assert size % 2 == 0, f'axis {axis} of size {size} is not be divisible by 2'
+    a, b = jnp.split(x, 2, axis)
+    return a * fastmath.expit(b)
+
+  return Fn('Glu', _f)
 
 
 class ThresholdedLinearUnit(base.Layer):
