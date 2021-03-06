@@ -35,6 +35,7 @@ from trax.layers.normalization import *
 from trax.layers.pooling import *
 from trax.layers.research.efficient_attention import *
 from trax.layers.research.position_encodings import *
+from trax.layers.research.rel_attention import *
 from trax.layers.research.sparsity import *
 from trax.layers.reversible import *
 from trax.layers.rnn import *
@@ -69,8 +70,10 @@ ThresholdedLinearUnit = layer_configure(ThresholdedLinearUnit)
 
 Attention = layer_configure(Attention, denylist=['mode'])
 CausalAttention = layer_configure(CausalAttention, denylist=['mode'])
+FavorAttention = layer_configure(FavorAttention, denylist=['mode'])
 Favor = layer_configure(Favor, denylist=['mode'])
 CausalFavor = layer_configure(CausalFavor, denylist=['mode'])
+CausalFavorAttention = layer_configure(CausalFavorAttention, denylist=['mode'])
 DotProductCausalAttention = layer_configure(
     DotProductCausalAttention, denylist=['mode'])
 SelfAttention = layer_configure(SelfAttention, denylist=['mode'])
@@ -105,3 +108,6 @@ WeightedCategoryAccuracy = layer_configure(WeightedCategoryAccuracy)
 SequenceAccuracy = layer_configure(SequenceAccuracy)
 CategoryCrossEntropy = layer_configure(CategoryCrossEntropy)
 WeightedCategoryCrossEntropy = layer_configure(WeightedCategoryCrossEntropy)
+MacroAveragedFScore = layer_configure(MacroAveragedFScore)
+RelativeAttentionLayer = layer_configure(RelativeAttentionLayer)
+RelativeAttentionLMLayer = layer_configure(RelativeAttentionLMLayer)

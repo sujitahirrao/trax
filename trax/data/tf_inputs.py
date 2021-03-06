@@ -16,7 +16,6 @@
 # Lint as: python3
 """Trax TF input pipeline."""
 
-import collections
 import functools
 import itertools
 import json
@@ -34,9 +33,13 @@ import t5.data
 import tensorflow as tf
 import tensorflow_datasets as tfds
 import tensorflow_text as tf_text
+from trax import data
 from trax import fastmath
+from trax import layers as tl
+from trax import supervised
 from trax.data import debug_data_pipeline
 from trax.data import text_encoder
+from trax.fastmath import numpy as jnp
 
 
 # How many examples from the stream to skip at random during training.
@@ -621,6 +624,32 @@ def cifar10_augmentation_flatten_preprocess(dataset,
   dataset = dataset.map(flatten_image)
 
   return dataset
+
+
+@gin.configurable(denylist=['dataset', 'training'])
+def downsampled_imagenet_flatten_bare_preprocess(dataset, training):
+  """Preprocessing for downsampled_imagenet.
+
+  Args:
+    dataset: the dataset.
+    training: unused option.
+
+  Returns:
+    Flattened dataset.
+
+  Preprocessing for downsampled_imagenet 32x32 and 64x64 generation from
+  http://arxiv.org/abs/1601.06759 (page 8).
+  """
+  del training
+
+  def flatten_image(features):
+    img = features['image']
+    flat = tf.cast(tf.reshape(img, [-1]), tf.int64)
+
+    new_features = {'image': flat}
+    return new_features
+
+  return dataset.map(flatten_image)
 
 
 @gin.configurable(denylist=['dataset', 'training'])
@@ -1334,107 +1363,234 @@ def CorpusToRandomChunks(dataset_name, num_tokens=512, train=True):  # pylint: d
       keys=['text'])
 
 
-@gin.configurable()
-def get_glue_key(task_name=gin.REQUIRED):
-  """Get glue key from the task name."""
-  ext_task_name = task_name if task_name.startswith(
-      'glue') else f'glue/{task_name}'
-  try:
-    glue_keys = {
-        'glue/cola': ('sentence',),
-        'glue/sst2': ('sentence',),
-        'glue/mrpc': ('sentence1', 'sentence2'),
-        'glue/qqp': ('question1', 'question2'),
-        'glue/stsb': ('sentence1', 'sentence2'),
-        'glue/mnli': ('premise', 'hypothesis'),
-        'glue/qnli': ('question', 'sentence'),
-        'glue/rte': ('sentence1', 'sentence2'),
-        'glue/wnli': ('sentence1', 'sentence2'),
-    }
-    return (*glue_keys[ext_task_name], 'label')
-  except KeyError:
-    raise KeyError(
-        f'Wrong task name entered, available glue tasks: {list(glue_keys.keys())}. Entered: {task_name}'
-    )
+_GLUE_KEYS = {
+    'cola': ('sentence',),
+    'sst2': ('sentence',),
+    'mrpc': ('sentence1', 'sentence2'),
+    'qqp': ('question1', 'question2'),
+    'stsb': ('sentence1', 'sentence2'),
+    'mnli': ('premise', 'hypothesis'),
+    'qnli': ('question', 'sentence'),
+    'rte': ('sentence1', 'sentence2'),
+    'wnli': ('sentence1', 'sentence2'),
+}
 
 
-def get_glue_t5_labels(dataset_name):
-  """Get glue labels for T5 from the task name."""
-  ext_task_name = dataset_name if dataset_name.startswith(
-      'glue') else f'glue/{dataset_name}'
-  try:
-    # Labels inferred from the T5 paper: https://arxiv.org/pdf/1910.10683.pdf
-    glue_t5_labels = {
-        'glue/cola': ('unacceptable', 'acceptable'),
-        'glue/sst2': ('negative', 'positive'),
-        'glue/mrpc': ('not_equivalent', 'equivalent'),
-        'glue/qqp': ('not_duplicate', 'duplicate'),
-        # Requires processing of floats, though one can still measure
-        # performance for the sequence accuracy task.
-        'glue/stsb': ('sentence1', 'sentence2'),
-        'glue/mnli': ('entailment', 'neutral', 'contradiction'),
-        'glue/qnli': ('entailment', 'not_entailment'),
-        'glue/rte': ('entailment', 'not_entailment'),
-        # Used for evaluation and for training of T5.
-        # As explained in Section 2.4 of https://arxiv.org/pdf/1910.10683.pdf
-        # it has an overlap with WSC from Super-GLUE.
-        'glue/wnli': ('sentence1', 'sentence2'),
-    }
-    return glue_t5_labels[ext_task_name]
-  except KeyError:
-    raise KeyError(
-        f'Wrong task name entered, available glue tasks: {list(glue_t5_labels.keys())}. Entered: {dataset_name}'
-    )
+# Labels inferred from the T5 paper: https://arxiv.org/pdf/1910.10683.pdf
+_GLUE_LABELS = {
+    'cola': ('unacceptable', 'acceptable'),
+    'sst2': ('negative', 'positive'),
+    'mrpc': ('not_equivalent', 'equivalent'),
+    'qqp': ('not_duplicate', 'duplicate'),
+    'stsb': ('sentence1', 'sentence2'),
+    'mnli': ('entailment', 'neutral', 'contradiction'),
+    'qnli': ('entailment', 'not_entailment'),
+    'rte': ('entailment', 'not_entailment'),
+    'wnli': ('sentence1', 'sentence2'),
+}
+
+# Defining separate <Foo>TrainStream and <Foo>EvalStream functions (below)
+# makes gin configuration expressions more direct. A single gin line can
+# configure each; for example:
+#
+#   BertGlueTrainStream.benchmark= 'mnli'
+#   BertGlueEvalStream.benchmark = 'mnli'
 
 
-def get_t5_splits(dataset_name, train=True):
-  """Get splits for glue tasks."""
-  # Splits listed in https://www.tensorflow.org/datasets/catalog/glue
-  glue_t5_labels = collections.defaultdict(lambda: ('train', 'validation'))
-  glue_t5_labels['glue/mnli'] = ('train', 'validation_matched')
-  if train:
-    return glue_t5_labels[dataset_name][0]
+# pylint: disable=invalid-name
+def BertGlueTrainStream(benchmark=gin.REQUIRED):
+  """Returns a Bert-preprocessed training stream for ``benchmark``.
+
+  Args:
+    benchmark: Simple lower-case name of a GLUE benchmark, e.g., ``'cola'``,
+        ``'mnli'``, ``'rte'``.
+  """
+  return _BertGlueDataStream(benchmark + '_t')
+
+
+def BertGlueEvalStream(benchmark=gin.REQUIRED):
+  """Returns a Bert-preprocessed eval data stream for ``benchmark``.
+
+  Args:
+    benchmark: Simple lower-case name of a GLUE benchmark, e.g., ``'cola'``,
+        ``'mnli'``, ``'rte'``. If the benchmark includes an alternate
+        eval (e.g., MNLI's "mismatched" eval/validation split), you can
+        specify it with an ``'_e2'`` suffix, e.g., ``'mnli_e2'``.
+  """
+  if benchmark.endswith('_e') or benchmark.endswith('e2'):
+    return _BertGlueDataStream(benchmark)
   else:
-    return glue_t5_labels[dataset_name][1]
+    return _BertGlueDataStream(benchmark + '_e')
 
 
-def CreateT5GlueInputs(  # pylint: disable=invalid-name
-    dataset_name='glue/qnli',
-    split=None,
-    train=True,
-    label_names=('entailment', 'not_entailment')):
-  """Prepares glue inputs for T5 models using standard T5 preprocessor."""
+def _BertGlueDataStream(benchmark_id):
+  """Returns a Bert-preprocessed data stream for ``benchmark_id``.
 
-  label_names = get_glue_t5_labels(dataset_name)
-  if not split:
-    split = get_t5_splits(dataset_name, train)
-  benchmark_name = dataset_name.split('/')[1]
-  dataset = tfds.load(name=dataset_name, split=split)
-  proc_dataset = generic_text_dataset_preprocess_fn(
+  Args:
+    benchmark_id: String that indicates the name and data split of a GLUE
+        benchmark. Data splits are indicated as underscore suffixes, e.g.,
+        ``'cola_t'`` (Cola benchmark, training split), ``'rte_e'`` (RTE
+        benchmark, eval/validation split), and ``'mnli_e2'`` (MNLI benchmark,
+        alternate "mismatched" eval/validation split).
+  """
+  benchmark, split = benchmark_id.rsplit('_', 1)
+  glue_data = TFDS(f'glue/{benchmark}',
+                   keys=_GLUE_KEYS[benchmark],
+                   train=(split == 't'))
+  # TODO(jonni): Currently can't access MNLI "mismatched"; fix this?
+  return data.Serial(
+      glue_data,
+      data.Tokenize(),
+      data.CreateBertInputs(),
+      data.Shuffle(),
+      data.PadToLength(),
+      data.TruncateToLength(),
+      data.Batch(),
+  )
+
+
+def T5GlueTrainStream(benchmark=gin.REQUIRED):
+  """Returns a T5-preprocessed training data stream for ``benchmark``.
+
+  Args:
+    benchmark: Simple lower-case name of a GLUE benchmark, e.g., ``'cola'``,
+        ``'mnli'``, ``'rte'``.
+  """
+  return _T5GlueDataStream(benchmark + '_t')
+
+
+def T5GlueTrainStreamsParallel(benchmark_list=gin.REQUIRED):
+  """Returns a parallel set of training streams, based on ``benchmark_list``.
+
+  Args:
+    benchmark_list: List of simple lower-case names of GLUE benchmarks, e.g.,
+        ``'cola'``, ``'mnli'``, ``'rte'``.
+  """
+  stream_list = map(T5GlueTrainStream, benchmark_list)
+  return data.Parallel(stream_list)
+
+
+def T5GlueEvalStream(benchmark=gin.REQUIRED):
+  """Returns a T5-preprocessed eval data stream for ``benchmark``.
+
+  Args:
+    benchmark: Simple lower-case name of a GLUE benchmark, e.g., ``'cola'``,
+        ``'mnli'``, ``'rte'``. If the benchmark includes an alternate
+        eval (e.g., MNLI's "mismatched" eval/validation split), you can
+        specify it with an ``'_e2'`` suffix, e.g., ``'mnli_e2'``.
+  """
+  if benchmark.endswith('_e') or benchmark.endswith('_e2'):
+    return _T5GlueDataStream(benchmark)
+  else:
+    return _T5GlueDataStream(benchmark + '_e')
+
+
+def T5GlueEvalStreamsParallel(benchmark_list=gin.REQUIRED):
+  """Returns a parallel set of T5 eval streams, based on ``benchmark_list``.
+
+  Args:
+    benchmark_list: List of strings, each of which is a simple lower-case name
+        of a GLUE benchmark, e.g., ``'cola'``, ``'mnli'``, ``'rte'``. If a
+        benchmark includes an alternate eval (e.g., MNLI's "mismatched"
+        eval/validation split), you can specify it with an ``'_e2'`` suffix,
+        e.g., ``'mnli_e2'``.
+  """
+  stream_list = map(T5GlueEvalStream, benchmark_list)
+  return data.Parallel(stream_list)
+
+
+def _T5GlueDataStream(benchmark_id):
+  """Returns a T5-preprocessed data stream for ``benchmark_id``.
+
+  Args:
+    benchmark_id: String that indicates the name and data split of a GLUE
+        benchmark. Data splits are indicated as underscore suffixes, e.g.,
+        ``'cola_t'`` (Cola benchmark, training split), ``'rte_e'`` (RTE
+        benchmark, eval/validation split), and ``'mnli_e2'`` (MNLI benchmark,
+        alternate "mismatched" eval/validation split).
+  """
+  return data.Serial(
+      _t5_glue_data_split(benchmark_id),
+      data.Shuffle(),
+      data.PadToLength(),
+      data.TruncateToLength(),
+      data.Batch(),
+  )
+
+
+def T5GlueEvalTasks(benchmark_list=gin.REQUIRED):
+  """Returns a list of T5 GLUE eval tasks, based on ``benchmark_list``.
+
+  Args:
+    benchmark_list: List of strings, each of which indicates the name and
+        data split of a GLUE benchmark. Data splits are indicated as underscore
+        suffixes, e.g., ``'cola_t'`` (Cola benchmark, training split),
+        ``'rte_e'`` (RTE benchmark, eval/validation split), and ``'mnli_e2'``
+        (MNLI alternate "mismatched" eval/validation split).
+  """
+  task_list = map(_T5GlueEvalTask, benchmark_list)
+  return task_list
+
+
+def _T5GlueEvalTask(benchmark_id):
+  """Returns a T5 GLUE eval task, based on ``benchmark_id``."""
+  eval_data = T5GlueEvalStream(benchmark_id)
+  metrics = [tl.WeightedCategoryAccuracy(), tl.SequenceAccuracy()]
+  benchmark, split = benchmark_id.rsplit('_', 1)
+  if benchmark == 'cola':
+    name_upper = 'Cola'
+  elif benchmark == 'mnli':
+    name_upper = 'MNLI_matched' if split == 'e' else 'MNLI_mismatched'
+  else:
+    name_upper = benchmark.upper()
+  return supervised.training.EvalTask(
+      eval_data,
+      metrics,
+      metric_names=[f'{name_upper} accuracy',
+                    f'{name_upper} sequence accuracy'])
+
+
+def _t5_glue_data_split(benchmark_id):
+  """Returns a GLUE data split prepared with the standard T5 preprocessor."""
+  benchmark, split = _t5_glue_benchmark_and_split(benchmark_id)
+  dataset = tfds.load(name=f'glue/{benchmark}', split=split)
+  processed_dataset = generic_text_dataset_preprocess_fn(
       dataset,
       spm_path=t5.data.DEFAULT_SPM_PATH,
       text_preprocess_fns=[
           lambda ds, training: t5.data.preprocessors.glue(  # pylint: disable=g-long-lambda
               ds,
-              benchmark_name=benchmark_name,
-              label_names=label_names)
+              benchmark_name=benchmark,
+              label_names=_GLUE_LABELS[benchmark])
       ],
       copy_pretokenized=True,
       debug_print_examples=True,
       debug_print_examples_rate=0.05)
-  proc_dataset = tfds.as_numpy(proc_dataset)
+  dataset_as_numpy = tfds.as_numpy(processed_dataset)
 
-  def t5_yield_examples(generator=None):
+  def stream_of_inputs_targets_weights(generator=None):
     del generator
     while True:
-      for example in proc_dataset:
+      for example in dataset_as_numpy:
         input_values = example['inputs']
         target_values = example['targets']
-        yield (fastmath.numpy.array(input_values),
-               fastmath.numpy.array(target_values),
-               fastmath.numpy.array([1] * len(target_values)))
+        yield (jnp.array(input_values),
+               jnp.array(target_values),
+               jnp.array([1] * len(target_values)))
 
-  return t5_yield_examples
+  return stream_of_inputs_targets_weights
+
+
+def _t5_glue_benchmark_and_split(benchmark_id):
+  benchmark, mode = benchmark_id.rsplit('_', 1)
+  if mode == 't':
+    split = 'train'
+  elif benchmark == 'mnli':
+    split = 'validation_mismatched' if mode == 'e2' else 'validation_matched'
+  else:
+    split = 'validation'
+  return benchmark, split
+# pylint: enable=invalid-name
 
 
 def compute_single_result(op_name, num_args):
