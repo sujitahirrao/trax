@@ -76,7 +76,7 @@ NamedStream = collections.namedtuple(
 )
 
 
-@gin.configurable()
+@gin.configurable
 def named_stream(name=gin.REQUIRED, stream=gin.REQUIRED):
   return NamedStream(name=name, stream=stream)
 
@@ -596,7 +596,7 @@ def train(output_dir,
     raise ValueError('Only one of ["permanent_checkpoint_frequency", '
                      '"permanent_checkpoints_at"] should be set.')
   if use_loop:
-    n_devices = num_devices() or fastmath.device_count()
+    n_devices = num_devices() or fastmath.local_device_count()
 
     # Prepare the training task.
     # Inputs is either an Inputs instance or a function that returns it.
