@@ -12,21 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import trax.data
 import trax.layers
 import trax.models
 import trax.optimizers
-import trax.data.tf_inputs
 import trax.supervised.trainer_lib
 
 # Parameters that will vary between experiments:
 # ==============================================================================
 n_layers = 6
 pos_type = 'fixed-base'
-attn_type = @LSHSelfAttention  # @CausalFavor
+attn_type = @trax.layers.SelfAttention # @CausalFavor
 
 # Parameters for batcher:
 # ==============================================================================
-batcher.data_streams = @tf_inputs.data_streams
+batcher.data_streams = @data.data_streams
 batcher.batch_size_per_device = 1
 batcher.eval_batch_size = 8
 batcher.max_eval_length = 12288  # 64 * 64 * 3
@@ -38,7 +38,7 @@ data_streams.data_dir = None
 data_streams.dataset_name = 'downsampled_imagenet/64x64'
 data_streams.input_name = 'image'
 data_streams.target_name = 'image'
-data_streams.bare_preprocess_fn = @trax.data.tf_inputs.downsampled_imagenet_flatten_bare_preprocess
+data_streams.bare_preprocess_fn = @data.downsampled_imagenet_flatten_bare_preprocess
 
 # Parameters for multifactor:
 # ==============================================================================
@@ -66,17 +66,11 @@ train.checkpoints_at = \
     [1000, 5000, 10000, 20000, 40000, 60000, 80000,
      100000, 200000, 300000, 400000, 500000]
 
-# Parameters for LSHSelfAttention:
+# Parameters for SelfAttention:
 # ==============================================================================
-LSHSelfAttention.attention_dropout = 0.2
-LSHSelfAttention.chunk_len = 128
-LSHSelfAttention.n_buckets = 192
-LSHSelfAttention.n_chunks_after = 0
-LSHSelfAttention.n_chunks_before = 1
-LSHSelfAttention.n_hashes = 2
-LSHSelfAttention.n_parallel_heads = 1
-LSHSelfAttention.predict_drop_len = 256
-LSHSelfAttention.predict_mem_len = 12288
+layers.SelfAttention.chunk_len = 1024
+layers.SelfAttention.n_chunks_after = 0
+layers.SelfAttention.n_chunks_before = 0
 
 # Parameters for RelformerLM:
 # ==============================================================================

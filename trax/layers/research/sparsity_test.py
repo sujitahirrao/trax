@@ -141,6 +141,27 @@ class EfficientFeedForwardTest(test.TestCase, parameterized.TestCase):
           x, weights, state, rng=jax.random.PRNGKey(0))
       self.assertEqual(out.shape, x.shape)
 
+  def test_sparse_ff_kernel_scaling(self):
+    d_model = 8
+    n_elements_in_block = 2
+    d_ff = 16
+    x_shape = (2, 8, d_model)
+    temperature = 0.7
+    with fastmath.use_backend(fastmath.Backend.JAX):
+      x = np.ones(x_shape).astype(np.float32)
+      input_signature = shapes.signature(x)
+      model = sparsity.SparseFF(
+          d_ff=d_ff,
+          n_elements_in_block=n_elements_in_block,
+          temperature=temperature,
+          ff_chunk_size=4,
+          mode='train',
+          kernel_scaling=True)
+      weights, state = model.init(input_signature)
+      out, _ = model.pure_fn(
+          x, weights, state, rng=jax.random.PRNGKey(0))
+      self.assertEqual(out.shape, x.shape)
+
   def test_switchsparse_ff_train(self):
     d_model = 1024
     n_experts = 64
@@ -391,6 +412,36 @@ class FavorTest(test.TestCase):
     fwd = lambda weights, inp: layer.pure_fn(inp, weights, state, rng=rng)[0]
     g = fastmath.grad(fwd)(layer.weights, (x, x, w))
     self.assertEqual(g[0][1][0].shape, (3, 4))
+
+  def test_call_and_grad_approximate_softmax(self):
+    layer_partial = tl.Serial(
+        tl.Branch(tl.Embedding(11, 12), tl.PaddingMask()),
+        sparsity.Favor(d_feature=12, n_heads=3, n_random_features=128,
+                       use_approximate_softmax=True),
+        tl.Select([0], n_in=2),
+    )
+    layer = tl.Serial(
+        tl.Branch(tl.Embedding(11, 12), tl.PaddingMask()),
+        sparsity.Favor(d_feature=12, n_heads=3, n_random_features=128,
+                       use_approximate_softmax=True),
+        tl.Select([0], n_in=2),
+        tl.WeightedCategoryCrossEntropy(),
+    )
+    x = np.ones((3, 5), dtype=np.int32)
+    w = np.ones_like(x).astype(np.float32)
+    x_sig = shapes.signature(x)
+    w_sig = shapes.signature(w)
+    layer_partial.init(x_sig)
+    y = layer_partial(x)
+    self.assertEqual(y.shape, (3, 5, 12))
+    layer.init((x_sig, x_sig, w_sig))
+    y = layer((x, x, w))
+    self.assertEqual(y.shape, ())
+    state = layer.state
+    rng = fastmath.random.get_prng(0)
+    fwd = lambda weights, inp: layer.pure_fn(inp, weights, state, rng=rng)[0]
+    g = fastmath.grad(fwd)(layer.weights, (x, x, w))
+    self.assertEqual(g[0][1][0].shape, (11, 12))
 
   def test_causal_call_and_grad(self):
     layer = tl.Serial(

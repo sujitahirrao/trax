@@ -58,7 +58,8 @@ def t2t_problems():
   return t2tp
 
 
-@gin.configurable
+# TODO(jonni): Rename function to better match its return values.
+@gin.configurable(module='trax.data')
 def data_streams(dataset_name,
                  data_dir=None,
                  preprocess_fn=no_preprocess,
@@ -67,25 +68,27 @@ def data_streams(dataset_name,
                  eval_holdout_size=0,
                  input_name=None,
                  target_name=None):
-  """Make data streams for TF datasets.
+  """Creates `(train, eval)` data sources from ``dataset_name``.
 
   Args:
-    dataset_name: a TFDS or T2T dataset name. If it's a T2T dataset name, prefix
-      with 't2t_'.
-    data_dir: data directory.
-    preprocess_fn: function to use for pre-processing after appending targets to
+    dataset_name: Name of dataset belonging to TFDS or T2T. T2T dataset names
+      must start with ``'t2t_'``.
+    data_dir: Directory where the data is located.
+    preprocess_fn: Function to use for pre-processing after appending targets to
       inputs.
-    bare_preprocess_fn: function to use for pre-processing before appending
+    bare_preprocess_fn: Function to use for pre-processing before appending
       targets to inputs.
-    shuffle_buffer_size: size of the shuffle buffer.
-    eval_holdout_size: float from 0 to <1; if >0 use this much of training data
-      for evaluation (instead of looking for a pre-specified VALIDATION split).
-    input_name: optional, name of the inputs from the dictionary.
-    target_name: optional, name of the outputs either from the dictionary or as
-      a result of post-processing.
+    shuffle_buffer_size: Size of the shuffle buffer.
+    eval_holdout_size: If greater than 0, specifies a fraction of training data
+      to siphon off and use as eval data, in place of an separate eval split.
+    input_name: Name of the inputs from the dictionary.
+    target_name: Name of the outputs either from the dictionary or as a result
+      of post-processing.
 
   Returns:
-    A pair of python streams, one for training and one for eval.
+    A pair of functions, `(f, g)` for use as data sources; call `f()` to get an
+    iterator of training data samples, and call `g()` to get an iterator of eval
+    data samples.
   """
   data_dir = download_and_prepare(dataset_name, data_dir)
 
@@ -182,6 +185,7 @@ def _train_and_eval_dataset(dataset_name,
                             eval_holdout_size,
                             train_shuffle_files=True,
                             eval_shuffle_files=False,
+                            use_alt_eval=False,
                             subsplit=None):
   """Return train and evaluation datasets, feature info and supervised keys.
 
@@ -196,6 +200,10 @@ def _train_and_eval_dataset(dataset_name,
       files at startup. Set to False if you want data determinism.
     eval_shuffle_files: Boolean determining whether or not to shuffle the test
       files at startup. Set to False if you want data determinism.
+    use_alt_eval: If True, use the dataset's alternate/secondary eval split;
+      else use the dataset's default/only eval split. Currently, only the
+      `glue/mnli` dataset provides an alternate eval split, and this arg is
+      ignored for other datasets.
     subsplit: a pair of floats (x, y), both in [0, 1], saying which part of the
       full training dataset we should return (default: all of it, [0, 1]).
 
@@ -232,7 +240,8 @@ def _train_and_eval_dataset(dataset_name,
   if eval_holdout_examples > 0:
     eval_split = f'{train_split}[{eval_holdout_examples}:]'
   elif dataset_name == 'glue/mnli':
-    eval_split = 'validation_matched'
+    eval_split = (
+        'validation_mismatched' if use_alt_eval else 'validation_matched')
   elif dataset_name == 'c4/multilingual':
     eval_split = 'en-validation'
   else:
@@ -257,18 +266,47 @@ def _train_and_eval_dataset(dataset_name,
   return train, valid, keys
 
 
-@gin.configurable
+# TODO(jonni): Consider renaming this function.
+@gin.configurable(module='trax.data')
 def TFDS(  # pylint: disable=invalid-name
     dataset_name,
     data_dir=None,
     tfds_preprocess_fn=None,
     keys=None,
     train=True,
+    use_alt_eval=False,
     shuffle_train=True,
     host_id=None,
     n_hosts=None,
     eval_holdout_size=0):
-  """Returns an iterator of numpy arrays representing the dataset."""
+  """Creates a data source from TensorFlow dataset ``dataset_name``.
+
+  Args:
+    dataset_name: Name of the dataset, as registered in TensorFlow datasets
+      (e.g., ``'glue/mnli'``).
+    data_dir: Directory where the data is located.
+    tfds_preprocess_fn: If specified, function that applies to items in raw
+      dataset (before selecting specific features).
+    keys: Tuple of dataset-specific strings that select features from the
+      dataset.
+    train: If True, select the training split from the dataset; else select an
+      eval split.
+    use_alt_eval: If True, and if ``train`` is False, select the dataset's
+      alternate eval split if it has one (or fall back to the dataset's only
+      eval split). This currently affects only the `glue/mnli` dataset.
+    shuffle_train: If True, have TensorFlow pre-shuffle the training data; else
+      receive training data in deterministic sequence.
+    host_id: Integer id used for tracking data subsplits, in cases where
+      ``n_hosts`` > 1.
+    n_hosts: If greater than 1, prepare data subsplits for the given number of
+      hosts.
+    eval_holdout_size: If greater than 0, specifies a fraction of training data
+      to siphon off and use as eval data, in place of an separate eval split.
+
+  Returns:
+    A function `f` for use as a training or eval data source; call `f()` to get
+    an iterator of data samples.
+  """
   data_dir = download_and_prepare(dataset_name, data_dir)
 
   host_id = jax.host_id() if host_id is None else host_id
@@ -277,9 +315,13 @@ def TFDS(  # pylint: disable=invalid-name
     subsplit = (host_id / n_hosts, (host_id + 1) / n_hosts)
   else:
     subsplit = None
-  (train_data, eval_data, _) = _train_and_eval_dataset(
-      dataset_name, data_dir, eval_holdout_size,
-      train_shuffle_files=shuffle_train, subsplit=subsplit)
+  train_data, eval_data, _ = (
+      _train_and_eval_dataset(dataset_name,
+                              data_dir,
+                              eval_holdout_size,
+                              train_shuffle_files=shuffle_train,
+                              use_alt_eval=use_alt_eval,
+                              subsplit=subsplit))
   dataset = train_data if train else eval_data
   dataset = dataset if tfds_preprocess_fn is None else tfds_preprocess_fn(
       dataset)
@@ -394,7 +436,7 @@ def tokenize(stream,
       yield output
 
 
-@gin.configurable
+@gin.configurable(module='trax.data')
 def Tokenize(  # pylint: disable=invalid-name
     keys=None,
     vocab_type='subword',  # pylint: disable=invalid-name
@@ -447,6 +489,7 @@ def _to_unicode(s):
   return str(s, encoding='utf-8', errors='ignore')
 
 
+@gin.configurable(module='trax.data')
 def ConvertToUnicode(keys=None):  # pylint: disable=invalid-name
   """Converts to Unicode UTF-8 elements of an example.
 
@@ -545,7 +588,7 @@ def _get_vocab(vocab_type='subword', vocab_file=None, vocab_dir=None,
 
 
 # Makes the function accessible in gin configs, even with all args denylisted.
-@gin.configurable(denylist=['dataset', 'training'])
+@gin.configurable(module='trax.data', denylist=['dataset', 'training'])
 def cifar10_no_augmentation_preprocess(dataset, training):
   del training
 
@@ -575,7 +618,7 @@ def _cifar_augment_image(image):
 
 
 # Makes the function accessible in gin configs, even with all args denylisted.
-@gin.configurable(denylist=['dataset', 'training'])
+@gin.configurable(module='trax.data', denylist=['dataset', 'training'])
 def cifar10_augmentation_preprocess(dataset, training):
   """Preprocessing for cifar10 with augmentation (see below)."""
 
@@ -593,7 +636,7 @@ def cifar10_augmentation_preprocess(dataset, training):
   return dataset
 
 
-@gin.configurable(denylist=['dataset', 'training'])
+@gin.configurable(module='trax.data', denylist=['dataset', 'training'])
 def cifar10_augmentation_flatten_preprocess(dataset,
                                             training,
                                             predict_image_train_weight=0.01):
@@ -625,7 +668,7 @@ def cifar10_augmentation_flatten_preprocess(dataset,
   return dataset
 
 
-@gin.configurable(denylist=['dataset', 'training'])
+@gin.configurable(module='trax.data', denylist=['dataset', 'training'])
 def downsampled_imagenet_flatten_bare_preprocess(dataset, training):
   """Preprocessing for downsampled_imagenet.
 
@@ -651,7 +694,7 @@ def downsampled_imagenet_flatten_bare_preprocess(dataset, training):
   return dataset.map(flatten_image)
 
 
-@gin.configurable(denylist=['dataset', 'training'])
+@gin.configurable(module='trax.data', denylist=['dataset', 'training'])
 def concat_preprocess(dataset, training, pad_symbol=0):
   """Pre-processing function that concatenates input and target for LM."""
   del training
@@ -669,7 +712,7 @@ def concat_preprocess(dataset, training, pad_symbol=0):
   return dataset
 
 
-@gin.configurable(denylist=['dataset', 'training'])
+@gin.configurable(module='trax.data', denylist=['dataset', 'training'])
 def squeeze_targets_preprocess(dataset, training):
   """Pre-processing function that squeezes last axis of targets."""
   del training
@@ -683,7 +726,7 @@ def squeeze_targets_preprocess(dataset, training):
   return dataset
 
 
-@gin.configurable(denylist=['dataset', 'training'])
+@gin.configurable(module='trax.data', denylist=['dataset', 'training'])
 def lm1b_preprocess(dataset,
                     training,
                     max_target_length=-1,
@@ -706,7 +749,7 @@ def lm1b_preprocess(dataset,
 
 
 # TODO(lukaszkaiser): find a single more abstract way of text pre-processing.
-@gin.configurable(denylist=['dataset', 'training'])
+@gin.configurable(module='trax.data', denylist=['dataset', 'training'])
 def wmt_preprocess(dataset, training, max_length=-1, max_eval_length=-1):
   """Preprocessing for LM1B: filter out targets exceeding maximum length."""
 
@@ -727,7 +770,7 @@ def wmt_preprocess(dataset, training, max_length=-1, max_eval_length=-1):
   return dataset
 
 
-@gin.configurable(denylist=['dataset', 'training'])
+@gin.configurable(module='trax.data', denylist=['dataset', 'training'])
 def wmt_concat_preprocess(dataset, training, max_length=-1, max_eval_length=-1):
   """Preprocessing for WMT: filter exceeding maximum length and concatenate."""
   dataset = wmt_preprocess(dataset, training, max_length, max_eval_length)
@@ -745,7 +788,7 @@ def wmt_concat_preprocess(dataset, training, max_length=-1, max_eval_length=-1):
   return dataset
 
 
-@gin.configurable(denylist=['dataset', 'training'])
+@gin.configurable(module='trax.data', denylist=['dataset', 'training'])
 def lm_token_preprocessing(dataset, training):
   """Concatenates inputs, 0, targets, with masking only for targets."""
   del training
@@ -765,7 +808,7 @@ def lm_token_preprocessing(dataset, training):
   return dataset
 
 
-@gin.configurable(denylist=['hparams'])
+@gin.configurable(module='trax.data', denylist=['hparams'])
 def bair_robot_pushing_hparams(hparams=None,
                                video_num_input_frames=1,
                                video_num_target_frames=15):
@@ -776,7 +819,7 @@ def bair_robot_pushing_hparams(hparams=None,
     return video_num_input_frames, video_num_target_frames
 
 
-@gin.configurable(denylist=['dataset', 'training'])
+@gin.configurable(module='trax.data', denylist=['dataset', 'training'])
 def bair_robot_pushing_preprocess(dataset, training):
   """Pre-processing function that concatenates input and target frames."""
   del training
@@ -814,7 +857,7 @@ def sentencepiece_tokenize(stream, spm_path=None, extra_ids=0):
     yield np.array(vocab.encode(example))
 
 
-@gin.configurable
+@gin.configurable(module='trax.data')
 def SentencePieceTokenize(  # pylint: disable=invalid-name
     spm_path=None,
     extra_ids=0):
@@ -825,7 +868,7 @@ def SentencePieceTokenize(  # pylint: disable=invalid-name
       extra_ids=extra_ids)
 
 
-@gin.configurable(denylist=['dataset', 'training'])
+@gin.configurable(module='trax.data', denylist=['dataset', 'training'])
 def c4_preprocess(dataset,
                   training,
                   max_target_length=-1,
@@ -866,7 +909,7 @@ def c4_preprocess(dataset,
   return dataset
 
 
-@gin.configurable(denylist=['dataset', 'training'])
+@gin.configurable(module='trax.data', denylist=['dataset', 'training'])
 def c4_bare_preprocess_fn(dataset,
                           training=True,
                           spm_path=None,
@@ -927,7 +970,7 @@ def c4_bare_preprocess_fn(dataset,
   return dataset
 
 
-@gin.configurable(denylist=['dataset', 'training'])
+@gin.configurable(module='trax.data', denylist=['dataset', 'training'])
 def filter_dataset_on_len(dataset,
                           training,
                           len_map=None,
@@ -965,7 +1008,7 @@ def filter_dataset_on_len(dataset,
   return dataset
 
 
-@gin.configurable(denylist=['dataset', 'training'])
+@gin.configurable(module='trax.data', denylist=['dataset', 'training'])
 def truncate_dataset_on_len(dataset,
                             training,
                             len_map=None,
@@ -998,7 +1041,7 @@ def truncate_dataset_on_len(dataset,
   return dataset.map(truncate_example)
 
 
-@gin.configurable(denylist=['dataset', 'training'])
+@gin.configurable(module='trax.data', denylist=['dataset', 'training'])
 def pad_dataset_to_length(dataset, training, len_map=None):
   """Pad features less than specified length to specified length."""
   del training
@@ -1020,7 +1063,7 @@ def pad_dataset_to_length(dataset, training, len_map=None):
   return dataset.map(pad_to_len)
 
 
-@gin.configurable(denylist=['dataset', 'training'])
+@gin.configurable(module='trax.data', denylist=['dataset', 'training'])
 def add_eos_to_output_features(dataset,
                                training,
                                output_features='targets',
@@ -1038,7 +1081,7 @@ def add_eos_to_output_features(dataset,
   return dataset.map(add_eos)
 
 
-@gin.configurable(denylist=['dataset', 'training'])
+@gin.configurable(module='trax.data', denylist=['dataset', 'training'])
 def generic_text_dataset_preprocess_fn(dataset,
                                        training=True,
                                        text_preprocess_fns=None,
@@ -1125,7 +1168,7 @@ def generic_text_dataset_preprocess_fn(dataset,
   return dataset
 
 
-@gin.configurable
+@gin.configurable(module='trax.data')
 def get_t5_preprocessor_by_name(name=None, fn_kwargs=None):
   """Returns a closure of any T5 preprocessor function with its arguments.
 
@@ -1231,6 +1274,7 @@ def BertDoubleSentenceInputs(batch,  # pylint: disable=invalid-name
       yield value_vector, segment_embs, segment_embs
 
 
+@gin.configurable(module='trax.data')
 def CreateBertInputs(double_sentence=True,  # pylint: disable=invalid-name
                      labeled=True,
                      cls_id=101,
@@ -1240,6 +1284,7 @@ def CreateBertInputs(double_sentence=True,  # pylint: disable=invalid-name
       bert_inputs_fn, labeled=labeled, cls_id=cls_id, sep_id=sep_id)
 
 
+@gin.configurable(module='trax.data')
 def mask_random_tokens(batch,
                        explicit_vocab_size=30522,
                        masking_prob=0.15,
@@ -1321,6 +1366,7 @@ def mask_random_tokens(batch,
     yield (token_ids, *row_rest, original_tokens, token_weights)
 
 
+@gin.configurable(module='trax.data')
 def BertNextSentencePredictionInputs(dataset_name,  # pylint: disable=invalid-name
                                      data_dir=None,
                                      text_key='text',
@@ -1352,6 +1398,7 @@ def BertNextSentencePredictionInputs(dataset_name,  # pylint: disable=invalid-na
   return split_stream
 
 
+@gin.configurable(module='trax.data')
 def CorpusToRandomChunks(dataset_name, num_tokens=512, train=True):  # pylint: disable=invalid-name
   return TFDS(
       dataset_name,
@@ -1397,6 +1444,7 @@ _GLUE_LABELS = {
 
 
 # pylint: disable=invalid-name
+@gin.configurable(module='trax.data')
 def BertGlueTrainStream(benchmark=gin.REQUIRED):
   """Returns a Bert-preprocessed training stream for ``benchmark``.
 
@@ -1407,14 +1455,16 @@ def BertGlueTrainStream(benchmark=gin.REQUIRED):
   return _BertGlueDataStream(benchmark + '_t')
 
 
-def GlueEvalAddSuffix(benchmark):
-  """Returns the benchmark name with a suffix.
+# GLUE evals need special handling because one eval in particular, MNLI, has
+# two different eval sets: "matched" and "mismatched". The code in this module
+# distinguishes between the two using the suffixes '_e' versus '_e2',
+# respectively.
+def _ensure_eval_suffix(benchmark):
+  """Returns a string ending in an eval suffix; adds ``'_e'`` suffix if needed.
 
   Args:
-    benchmark: Simple lower-case name of a GLUE benchmark, e.g., ``'cola'``,
-      ``'mnli'``, ``'rte'``. If the benchmark includes an alternate eval (e.g.,
-      MNLI's "mismatched" eval/validation split), you can specify it with an
-      ``'_e2'`` suffix, e.g., ``'mnli_e2'``.
+    benchmark: Name of a benchmark or task, that might already include an
+        eval-indicating suffix (``'_e'`` or ``'_e2'``).
   """
   if benchmark.endswith('_e') or benchmark.endswith('_e2'):
     return benchmark
@@ -1422,6 +1472,7 @@ def GlueEvalAddSuffix(benchmark):
     return benchmark + '_e'
 
 
+@gin.configurable(module='trax.data')
 def BertGlueEvalStream(benchmark=gin.REQUIRED):
   """Returns a Bert-preprocessed eval data stream for ``benchmark``.
 
@@ -1431,7 +1482,7 @@ def BertGlueEvalStream(benchmark=gin.REQUIRED):
         eval (e.g., MNLI's "mismatched" eval/validation split), you can
         specify it with an ``'_e2'`` suffix, e.g., ``'mnli_e2'``.
   """
-  return _BertGlueDataStream(GlueEvalAddSuffix(benchmark))
+  return _BertGlueDataStream(_ensure_eval_suffix(benchmark))
 
 
 def _BertGlueDataStream(benchmark_id):
@@ -1444,12 +1495,12 @@ def _BertGlueDataStream(benchmark_id):
         benchmark, eval/validation split), and ``'mnli_e2'`` (MNLI benchmark,
         alternate "mismatched" eval/validation split).
   """
-  benchmark_id = GlueEvalAddSuffix(benchmark_id)
+  benchmark_id = _ensure_eval_suffix(benchmark_id)
   benchmark, split = benchmark_id.rsplit('_', 1)
   glue_data = TFDS(f'glue/{benchmark}',
                    keys=_GLUE_KEYS[benchmark],
-                   train=(split == 't'))
-  # TODO(jonni): Currently can't access MNLI "mismatched"; fix this?
+                   train=(split == 't'),
+                   use_alt_eval=(split == 'e2'))
   return data.Serial(
       glue_data,
       data.Tokenize(),
@@ -1461,6 +1512,7 @@ def _BertGlueDataStream(benchmark_id):
   )
 
 
+@gin.configurable(module='trax.data')
 def T5GlueTrainStream(benchmark=gin.REQUIRED):
   """Returns a T5-preprocessed training data stream for ``benchmark``.
 
@@ -1471,17 +1523,24 @@ def T5GlueTrainStream(benchmark=gin.REQUIRED):
   return _T5GlueDataStream(benchmark + '_t')
 
 
-def T5GlueTrainStreamsParallel(benchmark_list=gin.REQUIRED):
+@gin.configurable(module='trax.data')
+def T5GlueTrainStreamsParallel(benchmark_list=gin.REQUIRED, counters=None):
   """Returns a parallel set of training streams, based on ``benchmark_list``.
 
   Args:
     benchmark_list: List of simple lower-case names of GLUE benchmarks, e.g.,
         ``'cola'``, ``'mnli'``, ``'rte'``.
+    counters: a list of counters to be passed to data.Parallel, e.g.,
+    [8551, 392702, 2490] would be a reasonable counterpart to
+    benchmark_list = ["cola", "mnli", "rte"], see
+    https://github.com/google-research/text-to-text-transfer-transformer/blob/master/t5/data/glue_utils.py#L42
+    for more details on counters.
   """
   stream_list = list(map(T5GlueTrainStream, benchmark_list))
-  return data.Parallel(stream_list)()
+  return data.Parallel(stream_list, counters)()
 
 
+@gin.configurable(module='trax.data')
 def T5GlueEvalStream(benchmark=gin.REQUIRED):
   """Returns a T5-preprocessed eval data stream for ``benchmark``.
 
@@ -1491,9 +1550,10 @@ def T5GlueEvalStream(benchmark=gin.REQUIRED):
         eval (e.g., MNLI's "mismatched" eval/validation split), you can
         specify it with an ``'_e2'`` suffix, e.g., ``'mnli_e2'``.
   """
-  return _T5GlueDataStream(GlueEvalAddSuffix(benchmark))
+  return _T5GlueDataStream(_ensure_eval_suffix(benchmark))
 
 
+@gin.configurable(module='trax.data')
 def T5GlueEvalStreamsParallel(benchmark_list=gin.REQUIRED):
   """Returns a parallel set of T5 eval streams, based on ``benchmark_list``.
 
@@ -1508,7 +1568,7 @@ def T5GlueEvalStreamsParallel(benchmark_list=gin.REQUIRED):
   return data.Parallel(stream_list)()
 
 
-def _T5GlueDataStream(benchmark_id):
+def _T5GlueDataStream(benchmark_id, t5_tokenization=False):
   """Returns a T5-preprocessed data stream for ``benchmark_id``.
 
   Args:
@@ -1517,9 +1577,12 @@ def _T5GlueDataStream(benchmark_id):
         ``'cola_t'`` (Cola benchmark, training split), ``'rte_e'`` (RTE
         benchmark, eval/validation split), and ``'mnli_e2'`` (MNLI benchmark,
         alternate "mismatched" eval/validation split).
+    t5_tokenization: if true, then use t5_tokenization.
   """
   return data.Serial(
-      _t5_glue_data_split(benchmark_id),
+      _t5_glue_data_split(benchmark_id)
+      if t5_tokenization else _t5_glue_data_split_no_token(benchmark_id),
+      data.Tokenize(),
       data.Shuffle(),
       data.PadToLength(),
       data.TruncateToLength(),
@@ -1527,6 +1590,7 @@ def _T5GlueDataStream(benchmark_id):
   )
 
 
+@gin.configurable(module='trax.data')
 def T5GlueEvalTasks(benchmark_list=gin.REQUIRED):
   """Returns a list of T5 GLUE eval tasks, based on ``benchmark_list``.
 
@@ -1544,7 +1608,7 @@ def T5GlueEvalTasks(benchmark_list=gin.REQUIRED):
 def _T5GlueEvalTask(benchmark_id):
   """Returns a T5 GLUE eval task, based on ``benchmark_id``."""
   eval_data = T5GlueEvalStream(benchmark_id)
-  benchmark_id = GlueEvalAddSuffix(benchmark_id)
+  benchmark_id = _ensure_eval_suffix(benchmark_id)
   metrics = [tl.WeightedCategoryAccuracy(), tl.SequenceAccuracy()]
   benchmark, split = benchmark_id.rsplit('_', 1)
   if benchmark == 'cola':
@@ -1558,6 +1622,28 @@ def _T5GlueEvalTask(benchmark_id):
       metrics,
       metric_names=[f'{name_upper} accuracy',
                     f'{name_upper} sequence accuracy'])
+
+
+def _t5_glue_data_split_no_token(benchmark_id):
+  """Returns a GLUE data split prepared with the standard T5 preprocessor."""
+  benchmark, split = _t5_glue_benchmark_and_split(benchmark_id)
+  dataset = tfds.load(name=f'glue/{benchmark}', split=split)
+  processed_dataset = t5.data.preprocessors.glue(  # pylint: disable=g-long-lambda
+      dataset,
+      benchmark_name=benchmark,
+      label_names=_GLUE_LABELS[benchmark])
+
+  def stream_of_inputs_targets_weights(generator=None):
+    del generator
+    while True:
+      for example in processed_dataset:
+        input_values = example['inputs'].numpy()
+        target_values = example['targets'].numpy()
+        yield (input_values,
+               target_values,
+               jnp.array([1] * len(target_values)))
+
+  return stream_of_inputs_targets_weights
 
 
 def _t5_glue_data_split(benchmark_id):
@@ -1874,6 +1960,7 @@ def convert_to_subtract(const_string):
   return 'subtract({},const_0)'.format(const_string)
 
 
+@gin.configurable(module='trax.data')
 def CreateMathQAInputs(  # pylint: disable=invalid-name
     dataset_path=None,
     train=True,
@@ -2026,6 +2113,7 @@ def CreateMathQAInputs(  # pylint: disable=invalid-name
   return mathqa_yield_examples
 
 
+@gin.configurable(module='trax.data')
 def CreateAquaInputs(  # pylint: disable=invalid-name
     dataset_path=None,
     train=True,
@@ -2130,6 +2218,7 @@ def CreateAquaInputs(  # pylint: disable=invalid-name
   return aqua_yield_examples
 
 
+@gin.configurable(module='trax.data')
 def CreateDropInputs(  # pylint: disable=invalid-name
     train=True, mathqa_format=False):
   """Prepares Drop inputs.
@@ -2174,6 +2263,7 @@ def CreateDropInputs(  # pylint: disable=invalid-name
   return drop_yield_examples
 
 
+@gin.configurable(module='trax.data')
 def CreateAnnotatedDropInputs(  # pylint: disable=invalid-name
     dataset_path=None,
     train=True,

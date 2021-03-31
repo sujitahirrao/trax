@@ -37,8 +37,8 @@ calculate connection strengths:
 Computing connection strengths involves several concepts -- queries, keys,
 values, masks, attention heads -- that factor heavily into the API below.
 
-NOTE: Attention layers in this module include ``mode``-dependent behavior.
-The possible modes are:
+NOTE: Attention, positional encoding, and shift layers in this module include
+``mode``-dependent behavior. The possible modes are:
 
     - ``'train'``: in training -- dropouts and position shifts active
     - ``'eval'``:  in evals -- dropouts inactive, position shifts active
@@ -93,7 +93,8 @@ def Attention(d_feature, n_heads=1, dropout=0.0, mode='train'):
         (sets to zero) some attention strengths derived from query-key
         matching. As a result, on a given forward pass, some value vectors
         don't contribute to the output, analogous to how regular dropout can
-        cause some node activations to be ignored.
+        cause some node activations to be ignored. Applies only if layer is
+        created in ``'train'`` mode.
     mode: One of ``'train'``, ``'eval'``, or ``'predict'``.
   """
   return cb.Serial(
@@ -125,7 +126,8 @@ def AttentionQKV(d_feature, n_heads=1, dropout=0.0, mode='train',
         (sets to zero) some attention strengths derived from query-key
         matching. As a result, on a given forward pass, some value vectors
         don't contribute to the output, analogous to how regular dropout can
-        cause some node activations to be ignored.
+        cause some node activations to be ignored. Applies only if layer is
+        created in ``'train'`` mode.
     mode: One of ``'train'``, ``'eval'``, or ``'predict'``.
     cache_KV_in_predict: Whether to cache K/V arrays in ``'predict'`` mode.
     q_sparsity: Sparsity with which to process queries. If ``None``,
@@ -196,7 +198,8 @@ class PureAttention(base.Layer):
           (sets to zero) some attention strengths derived from query-key
           matching. As a result, on a given forward pass, some value vectors
           don't contribute to the output, analogous to how regular dropout can
-          cause some node activations to be ignored.
+          cause some node activations to be ignored. Applies only if layer is
+          created in ``'train'`` mode.
       mode: One of ``'train'``, ``'eval'``, or ``'predict'``.
     """
     super().__init__(n_in=4, n_out=2)
@@ -259,7 +262,8 @@ def _per_head_attention(queries, keys, values, mask, dropout, mode, rng):
         (sets to zero) some attention strengths derived from query-key
         matching. As a result, on a given forward pass, some value vectors
         don't contribute to the output, analogous to how regular dropout can
-        cause some node activations to be ignored.
+        cause some node activations to be ignored. Applies only in ``'train'``
+        mode.
     mode: One of ``'train'``, ``'eval'``, or ``'predict'``.
     rng: Single-use random number generator (JAX PRNG key).
 
@@ -314,7 +318,8 @@ class DotProductAttention(base.Layer):
           (sets to zero) some attention strengths derived from query-key
           matching. As a result, on a given forward pass, some value vectors
           don't contribute to the output, analogous to how regular dropout can
-          cause some node activations to be ignored.
+          cause some node activations to be ignored. Applies only if layer is
+          created in ``'train'`` mode.
       mode: One of ``'train'``, ``'eval'``, ``'predict'`` or ``'viz'``.
     """
     super().__init__(n_in=4, n_out=1)
@@ -443,7 +448,8 @@ def CausalAttention(d_feature, n_heads=1, dropout=0.0,
         (sets to zero) some attention strengths derived from query-key
         matching. As a result, on a given forward pass, some value vectors
         don't contribute to the output, analogous to how regular dropout can
-        cause some node activations to be ignored.
+        cause some node activations to be ignored. Applies only if layer is
+        created in ``'train'`` mode.
     max_inference_length: Maximum sequence length allowed in non-training
         modes.
     mode: One of ``'train'``, ``'eval'``, or ``'predict'``.
@@ -483,7 +489,8 @@ class DotProductCausalAttention(base.Layer):
           (sets to zero) some attention strengths derived from query-key
           matching. As a result, on a given forward pass, some value vectors
           don't contribute to the output, analogous to how regular dropout can
-          cause some node activations to be ignored.
+          cause some node activations to be ignored. Applies only if layer is
+          created in ``'train'`` mode.
       max_inference_length: Maximum sequence length allowed in non-training
           modes.
       mode: One of ``'train'``, ``'eval'``, or ``'predict'``.
@@ -536,7 +543,8 @@ def ShiftRight(n_positions=1, mode='train'):
 
   Args:
     n_positions: Number of positions to shift the input sequence rightward;
-        initial positions freed by the shift get padded with zeros.
+        initial positions freed by the shift get padded with zeros. Applies
+        only if layer is created in a non-``'eval'`` mode.
     mode: One of ``'train'``, ``'eval'``, or ``'predict'``.
   """
   # TODO(jonni): Include pad arg, like PaddingMask, to allow non-default pads?
@@ -621,7 +629,7 @@ class PositionalEncoding(base.Layer):
     Args:
       max_len: Maximum input sequence length.
       dropout: Probability of *not* adding positional encoding to a sequence
-          position.
+          position. Applies only if layer is created in ``'train'`` mode.
       dropout_broadcast_dims: Axes along which dropout mask values are
           broadcast rather than individually set at random.
       use_bfloat16: If ``True``, use bfloat16 weights instead of the default
@@ -649,18 +657,21 @@ class PositionalEncoding(base.Layer):
 
   def forward(self, inputs):
     """Returns the input activations, with added positional information."""
+    weights = self.weights
+    if len(weights.shape) < 3:  # old checkpoints have 1 in first dim already
+      weights = weights[None, :, :]  # [1, self._max_len, d_feature]
     if self._mode != 'predict':
       x = inputs
       symbol_size = jnp.shape(x)[1]
       if self._mode != 'train' or self._start_from_zero_prob >= 1.0:
-        px = self.weights[:, :symbol_size, :]
+        px = weights[:, :symbol_size, :]
       else:
         rng1, rng2 = fastmath.random.split(self.rng, 2)
         start = fastmath.random.randint(rng1, (), 0, self._max_offset_to_add)
         start_from_zero = fastmath.random.uniform(rng2, (), jnp.float32, 0, 1)
         start = jnp.where(start_from_zero < self._start_from_zero_prob,
                           jnp.zeros((), dtype=jnp.int32), start)
-        px = fastmath.dynamic_slice_in_dim(self.weights, start, symbol_size,
+        px = fastmath.dynamic_slice_in_dim(weights, start, symbol_size,
                                            axis=1)
       if self._dropout == 0:
         return x + px
@@ -683,7 +694,7 @@ class PositionalEncoding(base.Layer):
       # This positional encoding layer stores the index of the current
       # position and increments it on each call.
       emb = fastmath.dynamic_slice_in_dim(
-          self.weights, self.state, inputs.shape[1], axis=1)
+          weights, self.state, inputs.shape[1], axis=1)
       self.state += inputs.shape[1]
       return inputs + emb
 
@@ -700,8 +711,7 @@ class PositionalEncoding(base.Layer):
     div_term = np.exp(
         np.arange(0, d_feature, 2) * -(np.log(10000.0) / d_feature))
     pe[:, 0::2] = np.sin(position * div_term)
-    pe[:, 1::2] = np.cos(position * div_term)
-    pe = pe[np.newaxis, :, :]  # [1, self._max_len, d_feature]
+    pe[:, 1::2] = np.cos(position * div_term)  # [self._max_len, d_feature]
     if self._use_bfloat16:
       pe = pe.astype(jnp.bfloat16)
     self.weights = jnp.array(pe)  # Trainable parameters, initialized above.
